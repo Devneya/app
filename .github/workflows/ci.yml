@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -40,7 +47,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    needs: verify
+    needs: e2e
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -52,4 +59,30 @@ jobs:
         env:
           VITE_USE_MOCKS: "false"
           VITE_API_BASE_URL: https://api.devneya.com
-          VITE_GOTRUE_ANON_KEY: placeholder
+          VITE_GOTRUE_ANON_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.VITE_GOTRUE_ANON_KEY || 'placeholder' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

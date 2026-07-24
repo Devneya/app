@@ -30,6 +30,18 @@ All must pass. Do not rely on manual browser review alone.
 - Email: `demo@devneya.com`
 - Password: `password123`
 
+Mock subscribe returns a Dodo-shaped checkout URL (`checkout.dodopayments.com`); MSW does not host an in-app checkout page.
+
+## GitHub Pages deploy (main branch)
+
+CI builds with `VITE_USE_MOCKS=false` and deploys `dist/` to GitHub Pages after lint, typecheck, unit tests, and e2e pass.
+
+Required repository secret:
+
+- `VITE_GOTRUE_ANON_KEY` — same value as playground's `VITE_SUPABASE_PUBLIC_KEY` (GoTrue anon/public key from the VM deploy env; see control-plane `docs/credentials.md`).
+
+Also requires GitHub Pages enabled for the repo and (when ready) a custom domain CNAME for `app.devneya.com`.
+
 ## Auth note
 
 GoTrue is accessed via `@supabase/supabase-js` with `/auth/v1/` → `/auth/` URL rewrite in `src/supabase.ts` (same pattern as playground).

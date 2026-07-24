@@ -19,15 +19,19 @@ test.describe("auth flow", () => {
     await expect(page).toHaveScreenshot("dashboard-unsubscribed.png");
   });
 
-  test("subscribe redirects to checkout", async ({ page }) => {
+  test("subscribe navigates to Dodo checkout", async ({ page }) => {
+    await page.route("https://checkout.dodopayments.com/**", (route) =>
+      route.fulfill({ status: 200, body: "mock dodo checkout" }),
+    );
+
     await page.goto("/login");
     await page.getByLabel("Email").fill(MOCK_USER.email);
     await page.getByLabel("Password").fill(MOCK_USER.password);
     await page.getByRole("button", { name: "Sign in" }).click();
 
+    const checkoutNavigation = page.waitForURL(/checkout\.dodopayments\.com/);
     await page.getByRole("button", { name: "Subscribe" }).click();
-    await expect(page.getByRole("heading", { name: "Mock checkout" })).toBeVisible();
-    await expect(page).toHaveURL(/\/mock-checkout$/);
+    await checkoutNavigation;
   });
 
   test("logout returns to login", async ({ page }) => {

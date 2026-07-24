@@ -4,7 +4,6 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { ProtectedRoute } from "@/auth/ProtectedRoute";
 import { DashboardPage } from "@/pages/DashboardPage";
-import { MockCheckoutPage } from "@/pages/MockCheckoutPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { theme } from "@/theme";
 
@@ -21,7 +20,6 @@ export function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route path="/mock-checkout" element={<MockCheckoutPage />} />
       <Route
         path="/"
         element={

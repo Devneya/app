@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.build.json && vite build",
+    "postbuild": "cp dist/index.html dist/404.html",
     "typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.app.json --noEmit",
     "lint": "eslint src tests --max-warnings 0",
     "test": "vitest run",
