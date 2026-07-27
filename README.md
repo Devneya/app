@@ -45,7 +45,7 @@ npm run test:e2e
 
 On push to `main`, CI runs lint → typecheck → unit tests → e2e → production build → GitHub Pages deploy.
 
-Production build uses `VITE_USE_MOCKS=false`, `VITE_API_BASE_URL=https://api.devneya.com`, and `VITE_GOTRUE_ANON_KEY` from a repository secret (same value as playground's `VITE_SUPABASE_PUBLIC_KEY`; see control-plane `docs/credentials.md` for where the key lives).
+Production build uses `VITE_USE_MOCKS=false`, `VITE_API_BASE_URL=https://api.devneya.com`, and `VITE_GOTRUE_ANON_KEY` from a repository secret (same value as playground's `VITE_SUPABASE_PUBLIC_KEY`).
 
 The build copies `dist/index.html` to `dist/404.html` for SPA deep-link fallback on Pages.
 

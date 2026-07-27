@@ -38,7 +38,7 @@ CI builds with `VITE_USE_MOCKS=false` and deploys `dist/` to GitHub Pages after 
 
 Required repository secret:
 
-- `VITE_GOTRUE_ANON_KEY` — same value as playground's `VITE_SUPABASE_PUBLIC_KEY` (GoTrue anon/public key from the VM deploy env; see control-plane `docs/credentials.md`).
+- `VITE_GOTRUE_ANON_KEY` — same value as playground's `VITE_SUPABASE_PUBLIC_KEY` (GoTrue anon/public key from the VM deploy env).
 
 Also requires GitHub Pages enabled for the repo and (when ready) a custom domain CNAME for `app.devneya.com`.
 
