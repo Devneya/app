@@ -11,6 +11,7 @@ afterEach(() => {
   resetMockSession();
   cleanup();
   localStorage.clear();
+  sessionStorage.clear();
 });
 
 afterAll(() => server.close());

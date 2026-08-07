@@ -73,7 +73,7 @@ describe("InferencePage", () => {
     });
   });
 
-  it("cancels subscription and shows cancelled status", async () => {
+  it("schedules cancel at period end while staying active", async () => {
     setMockSubscribed(true);
     renderApp("/login");
     const user = await signInViaUi();
@@ -84,9 +84,10 @@ describe("InferencePage", () => {
     await user.click(screen.getByRole("button", { name: "Cancel subscription" }));
 
     await waitFor(() => {
-      expect(screen.getByText(/Status:/)).toHaveTextContent("cancelled");
+      expect(screen.getByText(/Status:/)).toHaveTextContent("active");
+      expect(screen.getByText(/Cancellation scheduled/i)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Cancel subscription" })).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Subscribe" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Resubscribe" })).toBeInTheDocument();
     });
   });
 

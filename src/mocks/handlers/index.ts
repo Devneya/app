@@ -163,15 +163,15 @@ export const accountHandlers = [
     if (!requireAuth(request)) {
       return unauthorized();
     }
-    const status = session.subscribed
-      ? session.cancelled
-        ? "cancelled"
-        : "active"
-      : "none";
+    // Mirror prod cancel-at-period-end: still "active" with access_until until the period ends.
+    const status = session.subscribed ? "active" : "none";
     return HttpResponse.json({
       limit: 5,
       used: session.subscribed ? 0.42 : 0,
       subscription_status: status,
+      ...(session.subscribed && session.cancelled
+        ? { access_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() }
+        : {}),
     });
   }),
 
@@ -193,9 +193,10 @@ export const accountHandlers = [
       return unauthorized();
     }
     session.cancelled = true;
+    const accessUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     return HttpResponse.json({
       status: "cancelled",
-      access_until: "2026-08-24T00:00:00Z",
+      access_until: accessUntil,
     });
   }),
 

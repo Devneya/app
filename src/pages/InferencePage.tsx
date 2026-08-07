@@ -17,6 +17,9 @@ import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
 
+/** Survives Dodo checkout round-trips until /account/usage exposes access_until. */
+const CANCEL_ACCESS_UNTIL_KEY = "devneya.cancelAccessUntil";
+
 /** Format USD for usage UI. Tiny spends must not round to "$0.00". */
 function formatUsd(value: number): string {
   if (!Number.isFinite(value) || value === 0) {
@@ -41,6 +44,48 @@ function formatAccessUntil(iso: string): string {
   });
 }
 
+function readStoredAccessUntil(): string | undefined {
+  try {
+    const raw = sessionStorage.getItem(CANCEL_ACCESS_UNTIL_KEY);
+    if (!raw) {
+      return undefined;
+    }
+    const at = Date.parse(raw);
+    if (Number.isNaN(at) || at <= Date.now()) {
+      sessionStorage.removeItem(CANCEL_ACCESS_UNTIL_KEY);
+      return undefined;
+    }
+    return raw;
+  } catch {
+    return undefined;
+  }
+}
+
+function storeAccessUntil(iso: string | undefined): void {
+  try {
+    if (!iso) {
+      sessionStorage.removeItem(CANCEL_ACCESS_UNTIL_KEY);
+      return;
+    }
+    sessionStorage.setItem(CANCEL_ACCESS_UNTIL_KEY, iso);
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function mergeUsageAccessUntil(usage: UsageResponse): UsageResponse {
+  if (usage.access_until) {
+    storeAccessUntil(usage.access_until);
+    return usage;
+  }
+  if (usage.subscription_status !== "active") {
+    storeAccessUntil(undefined);
+    return usage;
+  }
+  const stored = readStoredAccessUntil();
+  return stored ? { ...usage, access_until: stored } : usage;
+}
+
 export function InferencePage() {
   const { session } = useAuth();
   const queryClient = useQueryClient();
@@ -54,7 +99,7 @@ export function InferencePage() {
 
   const usageQuery = useQuery({
     queryKey: ["usage", token],
-    queryFn: () => fetchUsage(token),
+    queryFn: async () => mergeUsageAccessUntil(await fetchUsage(token)),
     enabled: Boolean(token),
   });
 
@@ -70,6 +115,7 @@ export function InferencePage() {
         window.location.href = data.checkout_url;
         return;
       }
+      storeAccessUntil(undefined);
       void queryClient.invalidateQueries({ queryKey: ["usage"] });
     },
   });
@@ -77,14 +123,28 @@ export function InferencePage() {
   const cancelMutation = useMutation({
     mutationFn: () => cancelSubscription(token),
     onSuccess: (data) => {
-      // Prod keeps subscription_status "active" until period end (cancel_at_period_end).
-      // Apply the cancel response so the UI updates immediately.
+      // Cancel response status "cancelled" means the cancel was accepted.
+      // With access_until, paid access continues — usage stays "active" until then.
+      if (data.access_until) {
+        storeAccessUntil(data.access_until);
+        queryClient.setQueryData<UsageResponse>(["usage", token], (current) =>
+          current
+            ? {
+                ...current,
+                subscription_status: "active",
+                access_until: data.access_until,
+              }
+            : current
+        );
+        return;
+      }
+      storeAccessUntil(undefined);
       queryClient.setQueryData<UsageResponse>(["usage", token], (current) =>
         current
           ? {
               ...current,
               subscription_status: "cancelled",
-              access_until: data.access_until,
+              access_until: undefined,
             }
           : current
       );
@@ -97,6 +157,7 @@ export function InferencePage() {
   const models = modelsQuery.data?.data ?? [];
   const status = usage?.subscription_status;
   const accessUntil = usage?.access_until;
+  const cancelScheduled = status === "active" && Boolean(accessUntil);
 
   async function copyKey() {
     if (!keyQuery.data?.key) {
@@ -165,9 +226,9 @@ export function InferencePage() {
                 <Typography>
                   Status: <strong>{status}</strong>
                 </Typography>
-                {status === "cancelled" && accessUntil ? (
+                {cancelScheduled ? (
                   <Typography variant="body2" color="text.secondary">
-                    Access until {formatAccessUntil(accessUntil)}
+                    Cancellation scheduled. Access until {formatAccessUntil(accessUntil!)}.
                   </Typography>
                 ) : null}
                 <Box>
@@ -211,7 +272,16 @@ export function InferencePage() {
                       Subscribe
                     </Button>
                   ) : null}
-                  {status === "active" ? (
+                  {cancelScheduled ? (
+                    <Button
+                      variant="contained"
+                      onClick={() => subscribeMutation.mutate()}
+                      disabled={subscribeMutation.isPending}
+                    >
+                      Resubscribe
+                    </Button>
+                  ) : null}
+                  {status === "active" && !cancelScheduled ? (
                     <Button
                       variant="outlined"
                       color="warning"
