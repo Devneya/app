@@ -17,3 +17,15 @@ export type KeyResponse = {
 export type ApiError = {
   error: string;
 };
+
+export type ModelObject = {
+  id: string;
+  object: "model" | string;
+  created: number;
+  owned_by: string;
+};
+
+export type ModelsListResponse = {
+  object: "list" | string;
+  data: ModelObject[];
+};

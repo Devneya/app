@@ -2,11 +2,20 @@ import { http, HttpResponse } from "msw";
 import { authBaseUrl, config } from "@/config";
 import {
   createDefaultMockSession,
+  getMockEmail,
+  isMockEmailConfirmed,
   MOCK_ACCESS_TOKEN,
   MOCK_CHECKOUT_URL,
+  MOCK_MODELS,
   MOCK_USER,
   MOCK_VIRTUAL_KEY,
   mockGoTrueAuthResponse,
+  mockGoTrueUser,
+  resetMockUserMetadata,
+  setMockEmail,
+  setMockEmailConfirmed,
+  setMockPendingEmail,
+  setMockUserMetadata,
   type MockSession,
 } from "@/mocks/data";
 
@@ -16,6 +25,7 @@ let mockPassword = MOCK_USER.password;
 export function resetMockSession(): void {
   session = createDefaultMockSession();
   mockPassword = MOCK_USER.password;
+  resetMockUserMetadata();
 }
 
 export function setMockSubscribed(value: boolean): void {
@@ -51,17 +61,34 @@ export const authHandlers = [
     if (!body.email || !body.password || body.password.length < 6) {
       return HttpResponse.json({ error: "invalid request" }, { status: 400 });
     }
-    session.accessToken = MOCK_ACCESS_TOKEN;
+    // Mirror mailer_autoconfirm=false: user created, no session / access_token.
     mockPassword = body.password;
-    return HttpResponse.json(mockGoTrueAuthResponse(body.email));
+    setMockEmail(body.email);
+    setMockEmailConfirmed(false);
+    setMockPendingEmail(null);
+    return HttpResponse.json({
+      ...mockGoTrueUser(body.email, { confirmed: false }),
+      confirmation_sent_at: new Date().toISOString(),
+    });
   }),
 
   http.post(`${authBase}/token`, async ({ request }) => {
     const body = (await request.json()) as { email?: string; password?: string };
-    if (body.email !== MOCK_USER.email || body.password !== mockPassword) {
-      return HttpResponse.json({ error: "invalid credentials" }, { status: 400 });
+    if (body.email !== getMockEmail() || body.password !== mockPassword) {
+      return HttpResponse.json(
+        { error: "invalid_grant", error_description: "Invalid login credentials" },
+        { status: 400 }
+      );
     }
-    return HttpResponse.json(mockGoTrueAuthResponse(MOCK_USER.email));
+    if (!isMockEmailConfirmed()) {
+      return HttpResponse.json(
+        { error: "invalid_grant", error_description: "Email not confirmed" },
+        { status: 400 }
+      );
+    }
+    session.accessToken = MOCK_ACCESS_TOKEN;
+    session.cancelled = false;
+    return HttpResponse.json(mockGoTrueAuthResponse(getMockEmail()));
   }),
 
   http.post(`${authBase}/recover`, async ({ request }) => {
@@ -77,16 +104,49 @@ export const authHandlers = [
     if (!requireAuth(request)) {
       return unauthorized();
     }
-    const body = (await request.json()) as { password?: string };
-    if (!body.password || body.password.length < 6) {
-      return HttpResponse.json({ error: "invalid password" }, { status: 400 });
+    const body = (await request.json()) as {
+      password?: string;
+      email?: string;
+      data?: Record<string, unknown>;
+    };
+    if (body.password !== undefined) {
+      if (body.password.length < 6) {
+        return HttpResponse.json({ error: "invalid password" }, { status: 400 });
+      }
+      mockPassword = body.password;
     }
-    mockPassword = body.password;
+    if (body.email !== undefined) {
+      const nextEmail = body.email.trim();
+      if (!nextEmail.includes("@")) {
+        return HttpResponse.json({ error: "invalid email" }, { status: 400 });
+      }
+      // Secure email change: keep current email until both confirmations complete.
+      setMockPendingEmail(nextEmail);
+    }
+    if (body.data && typeof body.data === "object") {
+      setMockUserMetadata(body.data);
+    }
+    if (body.password === undefined && body.data === undefined && body.email === undefined) {
+      return HttpResponse.json({ error: "invalid request" }, { status: 400 });
+    }
+    return HttpResponse.json(mockGoTrueUser(getMockEmail()));
+  }),
+
+  // supabase.auth.signOut() → POST /auth/logout?scope=global
+  http.post(`${authBase}/logout`, () => HttpResponse.json({}, { status: 200 })),
+];
+
+export const llmHandlers = [
+  http.get(`${apiBase}/llm/v1/models`, () => {
+    const now = Math.floor(Date.now() / 1000);
     return HttpResponse.json({
-      id: MOCK_USER.id,
-      email: MOCK_USER.email,
-      role: "authenticated",
-      updated_at: new Date().toISOString(),
+      object: "list",
+      data: MOCK_MODELS.map((id) => ({
+        id,
+        object: "model",
+        created: now,
+        owned_by: "devneya",
+      })),
     });
   }),
 ];
@@ -156,4 +216,4 @@ export const accountHandlers = [
   }),
 ];
 
-export const handlers = [...authHandlers, ...accountHandlers];
+export const handlers = [...authHandlers, ...accountHandlers, ...llmHandlers];

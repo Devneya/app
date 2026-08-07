@@ -10,24 +10,38 @@ import {
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/supabase";
 
+export type SignUpResult = {
+  needsEmailConfirmation: boolean;
+};
+
 type AuthContextValue = {
   session: Session | null;
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
-  signUp: (email: string, password: string) => Promise<void>;
+  signUp: (email: string, password: string) => Promise<SignUpResult>;
   signOut: () => Promise<void>;
   resetPasswordForEmail: (email: string) => Promise<void>;
   updatePassword: (password: string) => Promise<void>;
   changePassword: (currentPassword: string, nextPassword: string) => Promise<void>;
+  updateDisplayName: (name: string) => Promise<void>;
+  updateEmail: (email: string) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-function recoveryRedirectTo(): string {
+function appOrigin(): string {
   if (typeof window === "undefined") {
-    return "https://app.devneya.com/reset-password";
+    return "https://app.devneya.com";
   }
-  return `${window.location.origin}/reset-password`;
+  return window.location.origin;
+}
+
+function recoveryRedirectTo(): string {
+  return `${appOrigin()}/reset-password`;
+}
+
+function confirmRedirectTo(): string {
+  return `${appOrigin()}/auth/confirm`;
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -57,17 +71,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const signUp = useCallback(async (email: string, password: string) => {
-    const { error } = await supabase.auth.signUp({ email, password });
+  const signUp = useCallback(async (email: string, password: string): Promise<SignUpResult> => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: confirmRedirectTo(),
+      },
+    });
     if (error) {
       throw error;
     }
+    return { needsEmailConfirmation: !data.session };
   }, []);
 
   const signOut = useCallback(async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) {
-      throw error;
+    const { error } = await supabase.auth.signOut({ scope: "global" });
+    if (!error) {
+      return;
+    }
+    // If the remote revoke fails (offline / mock gap / 403), still clear local session.
+    const { error: localError } = await supabase.auth.signOut({ scope: "local" });
+    if (localError) {
+      throw localError;
     }
   }, []);
 
@@ -108,6 +134,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [session?.user?.email]
   );
 
+  const updateDisplayName = useCallback(async (name: string) => {
+    const trimmed = name.trim();
+    const { error } = await supabase.auth.updateUser({
+      data: { name: trimmed },
+    });
+    if (error) {
+      throw error;
+    }
+  }, []);
+
+  const updateEmail = useCallback(async (email: string) => {
+    const trimmed = email.trim();
+    if (!trimmed) {
+      throw new Error("Email is required");
+    }
+    const { error } = await supabase.auth.updateUser(
+      { email: trimmed },
+      { emailRedirectTo: confirmRedirectTo() }
+    );
+    if (error) {
+      throw error;
+    }
+  }, []);
+
   const value = useMemo(
     () => ({
       session,
@@ -118,6 +168,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       resetPasswordForEmail,
       updatePassword,
       changePassword,
+      updateDisplayName,
+      updateEmail,
     }),
     [
       session,
@@ -128,6 +180,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       resetPasswordForEmail,
       updatePassword,
       changePassword,
+      updateDisplayName,
+      updateEmail,
     ]
   );
 

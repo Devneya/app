@@ -35,8 +35,45 @@ describe("LoginPage", () => {
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Account")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "LLM inference" })).toBeInTheDocument();
       expect(screen.getByText(MOCK_USER.email)).toBeInTheDocument();
+    });
+  });
+
+  it("shows check-email after signup without session", async () => {
+    renderApp("/login");
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Sign up" }));
+    await user.type(screen.getByRole("textbox", { name: /email/i }), "new@example.com");
+    await user.type(screen.getByLabelText(/password/i), "password123");
+    await user.click(screen.getByRole("button", { name: "Create account" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Check your email" })).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent(/new@example.com/i);
+    });
+    expect(screen.queryByRole("link", { name: "LLM inference" })).not.toBeInTheDocument();
+  });
+
+  it("shows email-not-confirmed on sign-in before confirmation", async () => {
+    renderApp("/login");
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Sign up" }));
+    await user.type(screen.getByRole("textbox", { name: /email/i }), "pending@example.com");
+    await user.type(screen.getByLabelText(/password/i), "password123");
+    await user.click(screen.getByRole("button", { name: "Create account" }));
+    await screen.findByRole("heading", { name: "Check your email" });
+    await user.click(screen.getByRole("button", { name: "Back to sign in" }));
+
+    await user.clear(screen.getByRole("textbox", { name: /email/i }));
+    await user.type(screen.getByRole("textbox", { name: /email/i }), "pending@example.com");
+    await user.type(screen.getByLabelText(/password/i), "password123");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/email not confirmed/i);
     });
   });
 

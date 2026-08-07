@@ -3,8 +3,30 @@ import { Navigate, Link as RouterLink } from "react-router-dom";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
 import { AuthShell } from "@/components/AuthShell";
+import { config } from "@/config";
 
 const PASSWORD_CHANGED_KEY = "devneya.passwordChanged";
+
+const DEMO_EMAIL = "demo@devneya.com";
+const DEMO_PASSWORD = "password123";
+
+function isLocalHost(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
+}
+
+function defaultDemoCredentials(): { email: string; password: string } {
+  // Vitest/jsdom reports hostname "localhost"; never prefill in tests.
+  if (import.meta.env.MODE === "test") {
+    return { email: "", password: "" };
+  }
+  if (isLocalHost() && config.useMocks) {
+    return { email: DEMO_EMAIL, password: DEMO_PASSWORD };
+  }
+  return { email: "", password: "" };
+}
 
 export function LoginPage() {
   const { session, signIn, signUp } = useAuth();
@@ -18,14 +40,42 @@ export function LoginPage() {
     }
     return false;
   });
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  const demoDefaults = defaultDemoCredentials();
+  const [email, setEmail] = useState(demoDefaults.email);
+  const [password, setPassword] = useState(demoDefaults.password);
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [checkEmail, setCheckEmail] = useState<string | null>(null);
 
   if (session) {
     return <Navigate to="/" replace />;
+  }
+
+  if (checkEmail) {
+    return (
+      <AuthShell
+        title="Check your email"
+        subtitle="Confirm your address to finish creating your account."
+      >
+        <Stack spacing={2}>
+          <Alert severity="success">
+            We sent a confirmation link to <strong>{checkEmail}</strong>. Open it to activate
+            your account, then sign in.
+          </Alert>
+          <Button
+            variant="contained"
+            onClick={() => {
+              setCheckEmail(null);
+              setMode("signin");
+              setPassword("");
+            }}
+          >
+            Back to sign in
+          </Button>
+        </Stack>
+      </AuthShell>
+    );
   }
 
   async function handleSubmit(event: React.FormEvent) {
@@ -36,7 +86,10 @@ export function LoginPage() {
       if (mode === "signin") {
         await signIn(email, password);
       } else {
-        await signUp(email, password);
+        const result = await signUp(email, password);
+        if (result.needsEmailConfirmation) {
+          setCheckEmail(email.trim());
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Authentication failed");
@@ -93,7 +146,10 @@ export function LoginPage() {
         <Link
           component="button"
           type="button"
-          onClick={() => setMode(mode === "signin" ? "signup" : "signin")}
+          onClick={() => {
+            setMode(mode === "signin" ? "signup" : "signin");
+            setError(null);
+          }}
         >
           {mode === "signin" ? "Sign up" : "Sign in"}
         </Link>

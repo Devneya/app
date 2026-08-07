@@ -13,4 +13,9 @@ const gotrueFetch: typeof fetch = (input, init) => {
 
 export const supabase = createClient(config.apiBaseUrl, config.gotrueAnonKey, {
   global: { fetch: gotrueFetch },
+  auth: {
+    // GoTrue confirmation / recovery links redirect with tokens in the URL hash.
+    flowType: "implicit",
+    detectSessionInUrl: true,
+  },
 });

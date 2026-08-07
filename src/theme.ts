@@ -1,85 +1,215 @@
 import { createTheme } from "@mui/material/styles";
 
-/** Brand tokens aligned with devneya.com / playground (black + yellow). */
+/**
+ * Lightweight “bones” tokens — closer to opencode.ai:
+ * warm cream canvas, near-black ink, monospace, hairlines, no playful chrome.
+ */
 export const brand = {
-  black: "#111111",
+  ink: "#201d1d",
+  canvas: "#fdfcfc",
+  paper: "#fdfcfc",
+  soft: "#f4f2f2",
+  muted: "#9a9898",
+  hairline: "rgba(15, 0, 0, 0.12)",
+  /** Light brand accent — used sparingly (focus, markers, progress). */
   yellow: "#ffc108",
-  yellowHover: "#f5b908",
-  paper: "#ffffff",
-  canvas: "#f5f5f5",
-  muted: "#666666",
+  yellowSoft: "#fff8e1",
+  blue: "#007aff",
+  red: "#ff3b30",
+  green: "#30d158",
+  orange: "#ff9f0a",
 } as const;
+
+const mono = '"IBM Plex Mono", "ui-monospace", "SFMono-Regular", Menlo, Consolas, monospace';
 
 export const theme = createTheme({
   palette: {
     mode: "light",
     primary: {
-      main: brand.black,
-      contrastText: "#ffffff",
+      main: brand.ink,
+      contrastText: brand.canvas,
     },
     secondary: {
       main: brand.yellow,
-      dark: brand.yellowHover,
-      contrastText: brand.black,
+      light: brand.yellowSoft,
+      contrastText: brand.ink,
+    },
+    error: {
+      main: brand.red,
+    },
+    warning: {
+      main: brand.orange,
+      contrastText: brand.ink,
+    },
+    success: {
+      main: brand.green,
+      contrastText: brand.ink,
+    },
+    info: {
+      main: brand.blue,
+      contrastText: brand.canvas,
     },
     text: {
-      primary: brand.black,
+      primary: brand.ink,
       secondary: brand.muted,
     },
     background: {
       default: brand.canvas,
       paper: brand.paper,
     },
+    divider: brand.hairline,
   },
   typography: {
-    fontFamily: '"Roboto Condensed", "Helvetica", "Arial", sans-serif',
-    h1: {
-      fontFamily: '"Monomaniac One", "Roboto Condensed", sans-serif',
-      fontWeight: 400,
+    fontFamily: mono,
+    allVariants: {
+      letterSpacing: "-0.01em",
     },
-    h4: {
-      fontFamily: '"Monomaniac One", "Roboto Condensed", sans-serif',
-      fontWeight: 400,
-    },
-    h6: {
-      fontFamily: '"Roboto Condensed", sans-serif',
-      fontWeight: 500,
-    },
+    h1: { fontWeight: 700, fontSize: "1.75rem", lineHeight: 1.35 },
+    h4: { fontWeight: 700, fontSize: "1.5rem", lineHeight: 1.35 },
+    h5: { fontWeight: 600, fontSize: "1.15rem", lineHeight: 1.4 },
+    h6: { fontWeight: 600, fontSize: "0.95rem", lineHeight: 1.4 },
+    body1: { fontWeight: 400, fontSize: "0.9375rem", lineHeight: 1.55 },
+    body2: { fontWeight: 400, fontSize: "0.8125rem", lineHeight: 1.5 },
     button: {
       textTransform: "none",
       fontWeight: 500,
+      fontSize: "0.875rem",
     },
   },
   shape: {
-    borderRadius: 8,
+    borderRadius: 4,
   },
   components: {
+    MuiCssBaseline: {
+      styleOverrides: {
+        body: {
+          backgroundColor: brand.canvas,
+          backgroundImage: "none",
+          minHeight: "100vh",
+        },
+      },
+    },
     MuiButton: {
       defaultProps: {
         disableElevation: true,
       },
       styleOverrides: {
-        root: ({ ownerState }) =>
-          ownerState.variant === "contained" && ownerState.color === "primary"
-            ? {
-                boxShadow: `3px 3px 0 ${brand.yellow}`,
-                "&:hover": {
-                  boxShadow: `3px 3px 0 ${brand.yellowHover}`,
-                  backgroundColor: "#000000",
-                },
-              }
-            : ownerState.variant === "contained" && ownerState.color === "secondary"
-              ? { fontWeight: 600 }
-              : {},
+        root: ({ ownerState }) => ({
+          borderRadius: 4,
+          boxShadow: "none",
+          ...(ownerState.variant === "contained" &&
+            ownerState.color === "primary" && {
+              backgroundColor: brand.ink,
+              color: brand.canvas,
+              "&:hover": {
+                backgroundColor: "#000000",
+                boxShadow: "none",
+              },
+            }),
+          ...(ownerState.variant === "outlined" && {
+            borderColor: brand.hairline,
+            backgroundColor: "transparent",
+          }),
+          "&:hover": {
+            boxShadow: "none",
+          },
+        }),
       },
     },
-    MuiCssBaseline: {
+    MuiTextField: {
+      defaultProps: {
+        variant: "outlined",
+        size: "small",
+      },
+    },
+    MuiInputLabel: {
       styleOverrides: {
-        body: {
-          backgroundImage:
-            "radial-gradient(ellipse at top, rgba(255,193,8,0.12), transparent 55%), linear-gradient(180deg, #fafafa 0%, #f0f0f0 100%)",
-          backgroundAttachment: "fixed",
-          minHeight: "100vh",
+        root: {
+          letterSpacing: 0,
+        },
+        // Keep labels above the field (no floating notch) — mono metrics
+        // otherwise slice through the outlined border.
+        outlined: {
+          position: "relative",
+          transform: "none",
+          marginBottom: 10,
+          maxWidth: "100%",
+          pointerEvents: "auto",
+          color: brand.muted,
+          lineHeight: 1.4,
+          "&.Mui-focused": {
+            color: brand.ink,
+          },
+          "&.MuiInputLabel-shrink": {
+            transform: "none",
+            backgroundColor: "transparent",
+            paddingInline: 0,
+          },
+        },
+      },
+    },
+    MuiOutlinedInput: {
+      styleOverrides: {
+        root: {
+          backgroundColor: brand.soft,
+          borderRadius: 4,
+          "&:hover .MuiOutlinedInput-notchedOutline": {
+            borderColor: brand.ink,
+          },
+          "&.Mui-focused": {
+            backgroundColor: brand.canvas,
+          },
+          "&.Mui-focused .MuiOutlinedInput-notchedOutline": {
+            borderColor: brand.yellow,
+            borderWidth: 1,
+          },
+        },
+        notchedOutline: {
+          borderColor: brand.hairline,
+          "& legend": {
+            display: "none",
+          },
+        },
+        input: {
+          letterSpacing: 0,
+        },
+      },
+    },
+    MuiAppBar: {
+      styleOverrides: {
+        root: {
+          boxShadow: "none",
+          borderBottom: `1px solid ${brand.hairline}`,
+          backgroundImage: "none",
+        },
+      },
+    },
+    MuiLinearProgress: {
+      styleOverrides: {
+        root: {
+          height: 4,
+          borderRadius: 0,
+          backgroundColor: brand.soft,
+        },
+        bar: {
+          borderRadius: 0,
+          backgroundColor: brand.yellow,
+        },
+      },
+    },
+    MuiAlert: {
+      styleOverrides: {
+        root: {
+          borderRadius: 4,
+          border: `1px solid ${brand.hairline}`,
+          boxShadow: "none",
+        },
+      },
+    },
+    MuiLink: {
+      styleOverrides: {
+        root: {
+          color: brand.ink,
         },
       },
     },

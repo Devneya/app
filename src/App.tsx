@@ -3,8 +3,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { ProtectedRoute } from "@/auth/ProtectedRoute";
-import { DashboardPage } from "@/pages/DashboardPage";
+import { AccountPage } from "@/pages/AccountPage";
+import { AuthConfirmPage } from "@/pages/AuthConfirmPage";
 import { ForgotPasswordPage } from "@/pages/ForgotPasswordPage";
+import { InferencePage } from "@/pages/InferencePage";
 import { LoginPage } from "@/pages/LoginPage";
 import { ResetPasswordPage } from "@/pages/ResetPasswordPage";
 import { theme } from "@/theme";
@@ -24,11 +26,20 @@ export function AppRoutes() {
       <Route path="/login" element={<LoginPage />} />
       <Route path="/forgot-password" element={<ForgotPasswordPage />} />
       <Route path="/reset-password" element={<ResetPasswordPage />} />
+      <Route path="/auth/confirm" element={<AuthConfirmPage />} />
       <Route
         path="/"
         element={
           <ProtectedRoute>
-            <DashboardPage />
+            <InferencePage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/account"
+        element={
+          <ProtectedRoute>
+            <AccountPage />
           </ProtectedRoute>
         }
       />
