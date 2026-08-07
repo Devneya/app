@@ -11,13 +11,19 @@ import {
 } from "@/mocks/data";
 
 let session: MockSession = createDefaultMockSession();
+let mockPassword = MOCK_USER.password;
 
 export function resetMockSession(): void {
   session = createDefaultMockSession();
+  mockPassword = MOCK_USER.password;
 }
 
 export function setMockSubscribed(value: boolean): void {
   session.subscribed = value;
+}
+
+export function getMockPassword(): string {
+  return mockPassword;
 }
 
 function unauthorized() {
@@ -46,18 +52,42 @@ export const authHandlers = [
       return HttpResponse.json({ error: "invalid request" }, { status: 400 });
     }
     session.accessToken = MOCK_ACCESS_TOKEN;
+    mockPassword = body.password;
     return HttpResponse.json(mockGoTrueAuthResponse(body.email));
   }),
 
   http.post(`${authBase}/token`, async ({ request }) => {
     const body = (await request.json()) as { email?: string; password?: string };
-    if (
-      body.email !== MOCK_USER.email ||
-      body.password !== MOCK_USER.password
-    ) {
+    if (body.email !== MOCK_USER.email || body.password !== mockPassword) {
       return HttpResponse.json({ error: "invalid credentials" }, { status: 400 });
     }
     return HttpResponse.json(mockGoTrueAuthResponse(MOCK_USER.email));
+  }),
+
+  http.post(`${authBase}/recover`, async ({ request }) => {
+    const body = (await request.json()) as { email?: string };
+    if (!body.email) {
+      return HttpResponse.json({ error: "email required" }, { status: 400 });
+    }
+    // GoTrue returns 200 even when the user is unknown (anti-enumeration).
+    return HttpResponse.json({});
+  }),
+
+  http.put(`${authBase}/user`, async ({ request }) => {
+    if (!requireAuth(request)) {
+      return unauthorized();
+    }
+    const body = (await request.json()) as { password?: string };
+    if (!body.password || body.password.length < 6) {
+      return HttpResponse.json({ error: "invalid password" }, { status: 400 });
+    }
+    mockPassword = body.password;
+    return HttpResponse.json({
+      id: MOCK_USER.id,
+      email: MOCK_USER.email,
+      role: "authenticated",
+      updated_at: new Date().toISOString(),
+    });
   }),
 ];
 

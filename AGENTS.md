@@ -46,6 +46,8 @@ Also requires GitHub Pages enabled for the repo and (when ready) a custom domain
 
 GoTrue is accessed via `@supabase/supabase-js` with `/auth/v1/` → `/auth/` URL rewrite in `src/supabase.ts` (same pattern as playground).
 
+Password recovery: `resetPasswordForEmail` with `redirectTo` → `/reset-password`. GoTrue must keep the default mailer path `/verify` (do **not** set `GOTRUE_MAILER_URLPATHS_RECOVERY` to the app route). SMTP env vars live in `Devneya/api` `deploy/.env` — see that repo’s `deploy/README.md`.
+
 ## Do not
 
 - Deploy to production VM or change DNS without explicit operator approval.

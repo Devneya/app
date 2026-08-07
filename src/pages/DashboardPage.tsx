@@ -1,13 +1,15 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import {
   Alert,
   AppBar,
+  Box,
   Button,
   Container,
   LinearProgress,
-  Paper,
   Stack,
+  TextField,
   Toolbar,
   Typography,
 } from "@mui/material";
@@ -21,16 +23,54 @@ import {
   logout,
   startSubscription,
 } from "@/api/account";
+import { brand } from "@/theme";
 
 function formatUsd(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
+function Section({
+  title,
+  children,
+  danger,
+}: {
+  title: string;
+  children: React.ReactNode;
+  danger?: boolean;
+}) {
+  return (
+    <Box
+      sx={{
+        bgcolor: "background.paper",
+        border: "1px solid",
+        borderColor: danger ? "error.light" : "divider",
+        borderRadius: 2,
+        p: 3,
+      }}
+    >
+      <Typography
+        variant="h6"
+        gutterBottom
+        color={danger ? "error" : "text.primary"}
+        sx={{ fontWeight: 600 }}
+      >
+        {title}
+      </Typography>
+      {children}
+    </Box>
+  );
+}
+
 export function DashboardPage() {
-  const { session, signOut } = useAuth();
+  const { session, signOut, changePassword } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const token = session?.access_token ?? "";
+
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
 
   const keyQuery = useQuery({
     queryKey: ["virtualKey", token],
@@ -78,6 +118,29 @@ export function DashboardPage() {
     onSuccess: () => navigate("/login"),
   });
 
+  const passwordMutation = useMutation({
+    mutationFn: async () => {
+      if (nextPassword.length < 6) {
+        throw new Error("Password must be at least 6 characters.");
+      }
+      if (nextPassword !== confirmPassword) {
+        throw new Error("Passwords do not match.");
+      }
+      await changePassword(currentPassword, nextPassword);
+      // Revoke API/server sessions, then clear local GoTrue session.
+      try {
+        await logout(token);
+      } catch {
+        // Still sign out locally even if revoke fails.
+      }
+      sessionStorage.setItem("devneya.passwordChanged", "1");
+      await signOut();
+    },
+    onSuccess: () => {
+      navigate("/login", { replace: true });
+    },
+  });
+
   const usage = usageQuery.data;
   const usagePercent =
     usage && usage.limit > 0 ? Math.min(100, (usage.used / usage.limit) * 100) : 0;
@@ -97,11 +160,46 @@ export function DashboardPage() {
 
   return (
     <>
-      <AppBar position="static" color="default" elevation={1}>
-        <Toolbar>
-          <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-            Devneya Account
+      <AppBar
+        position="static"
+        color="transparent"
+        elevation={0}
+        sx={{ borderBottom: "1px solid", borderColor: "divider", bgcolor: "background.paper" }}
+      >
+        <Toolbar sx={{ gap: 2 }}>
+          <Typography
+            variant="h6"
+            component="div"
+            sx={{
+              flexGrow: 1,
+              fontFamily: '"Monomaniac One", "Roboto Condensed", sans-serif',
+              fontWeight: 400,
+            }}
+          >
+            Devneya
+            <Box
+              component="span"
+              sx={{
+                ml: 1.5,
+                px: 1,
+                py: 0.25,
+                bgcolor: brand.yellow,
+                color: brand.black,
+                borderRadius: 1,
+                fontFamily: '"Roboto Condensed", sans-serif',
+                fontSize: 12,
+                fontWeight: 600,
+                verticalAlign: "middle",
+              }}
+            >
+              Account
+            </Box>
           </Typography>
+          {session?.user?.email ? (
+            <Typography variant="body2" color="text.secondary" sx={{ display: { xs: "none", sm: "block" } }}>
+              {session.user.email}
+            </Typography>
+          ) : null}
           <Button
             color="inherit"
             onClick={() => logoutMutation.mutate()}
@@ -120,10 +218,7 @@ export function DashboardPage() {
             </Alert>
           ) : null}
 
-          <Paper sx={{ p: 3 }}>
-            <Typography variant="h6" gutterBottom>
-              API key
-            </Typography>
+          <Section title="API key">
             {keyQuery.isLoading ? (
               <LinearProgress aria-label="Loading API key" />
             ) : keyQuery.error ? (
@@ -139,9 +234,11 @@ export function DashboardPage() {
                   sx={{
                     wordBreak: "break-all",
                     flex: 1,
-                    bgcolor: "grey.100",
+                    bgcolor: brand.canvas,
                     p: 1.5,
                     borderRadius: 1,
+                    border: "1px solid",
+                    borderColor: "divider",
                   }}
                 >
                   {keyQuery.data?.key}
@@ -155,12 +252,9 @@ export function DashboardPage() {
                 </Button>
               </Stack>
             )}
-          </Paper>
+          </Section>
 
-          <Paper sx={{ p: 3 }}>
-            <Typography variant="h6" gutterBottom>
-              Usage & subscription
-            </Typography>
+          <Section title="Usage & subscription">
             {usageQuery.isLoading ? (
               <LinearProgress aria-label="Loading usage" />
             ) : usageQuery.error || !usage ? (
@@ -177,6 +271,12 @@ export function DashboardPage() {
                   variant="determinate"
                   value={usagePercent}
                   aria-label="Usage progress"
+                  sx={{
+                    height: 8,
+                    borderRadius: 1,
+                    bgcolor: "grey.200",
+                    "& .MuiLinearProgress-bar": { bgcolor: brand.yellow },
+                  }}
                 />
                 <Stack direction="row" spacing={2}>
                   {usage.subscription_status === "none" ? (
@@ -201,12 +301,70 @@ export function DashboardPage() {
                 </Stack>
               </Stack>
             )}
-          </Paper>
+          </Section>
 
-          <Paper sx={{ p: 3 }}>
-            <Typography variant="h6" gutterBottom color="error">
-              Danger zone
-            </Typography>
+          <Section title="Account security">
+            <Stack
+              component="form"
+              spacing={2}
+              onSubmit={(event) => {
+                event.preventDefault();
+                setPasswordMessage(null);
+                passwordMutation.mutate();
+              }}
+            >
+              {passwordMutation.error ? (
+                <Alert severity="error">
+                  {passwordMutation.error instanceof Error
+                    ? passwordMutation.error.message
+                    : "Could not change password"}
+                </Alert>
+              ) : null}
+              {passwordMessage ? <Alert severity="success">{passwordMessage}</Alert> : null}
+              <TextField
+                label="Current password"
+                type="password"
+                autoComplete="current-password"
+                required
+                fullWidth
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+              />
+              <TextField
+                label="New password"
+                type="password"
+                autoComplete="new-password"
+                required
+                fullWidth
+                slotProps={{ htmlInput: { minLength: 6 } }}
+                value={nextPassword}
+                onChange={(e) => setNextPassword(e.target.value)}
+              />
+              <TextField
+                label="Confirm new password"
+                type="password"
+                autoComplete="new-password"
+                required
+                fullWidth
+                slotProps={{ htmlInput: { minLength: 6 } }}
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+              />
+              <Button
+                type="submit"
+                variant="contained"
+                disabled={passwordMutation.isPending}
+                sx={{ alignSelf: "flex-start" }}
+              >
+                Change password
+              </Button>
+              <Typography variant="body2" color="text.secondary">
+                Changing your password signs you out of other sessions.
+              </Typography>
+            </Stack>
+          </Section>
+
+          <Section title="Danger zone" danger>
             <Button
               variant="outlined"
               color="error"
@@ -215,7 +373,7 @@ export function DashboardPage() {
             >
               Delete account
             </Button>
-          </Paper>
+          </Section>
         </Stack>
       </Container>
     </>

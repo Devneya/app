@@ -7,9 +7,10 @@ import { MOCK_USER } from "@/mocks/data";
 describe("LoginPage", () => {
   it("renders sign-in form", () => {
     renderApp("/login");
-    expect(screen.getByRole("heading", { name: "Devneya" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: /email/i })).toBeInTheDocument();
     expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /forgot password/i })).toBeInTheDocument();
   });
 
   it("shows error on invalid credentials", async () => {
@@ -34,7 +35,15 @@ describe("LoginPage", () => {
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Devneya Account")).toBeInTheDocument();
+      expect(screen.getByText("Account")).toBeInTheDocument();
+      expect(screen.getByText(MOCK_USER.email)).toBeInTheDocument();
     });
+  });
+
+  it("navigates to forgot password", async () => {
+    renderApp("/login");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("link", { name: /forgot password/i }));
+    expect(screen.getByRole("heading", { name: "Forgot password" })).toBeInTheDocument();
   });
 });

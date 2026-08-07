@@ -5,7 +5,7 @@ import { renderApp } from "@/test/render";
 describe("ProtectedRoute", () => {
   it("redirects unauthenticated users to login", async () => {
     renderApp("/");
-    expect(await screen.findByRole("heading", { name: "Devneya" })).toBeInTheDocument();
-    expect(screen.queryByText("Devneya Account")).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Account security" })).not.toBeInTheDocument();
   });
 });
