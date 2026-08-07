@@ -1,4 +1,5 @@
 import type {
+  CancelSubscriptionResponse,
   KeyResponse,
   SubscribeResponse,
   UsageResponse,
@@ -43,8 +44,10 @@ export function startSubscription(
 
 export function cancelSubscription(
   accessToken: string
-): Promise<{ status: string; access_until?: string }> {
-  return apiFetch("/account/subscribe/cancel", accessToken, { method: "POST" });
+): Promise<CancelSubscriptionResponse> {
+  return apiFetch<CancelSubscriptionResponse>("/account/subscribe/cancel", accessToken, {
+    method: "POST",
+  });
 }
 
 export function logout(accessToken: string): Promise<{ status: string }> {

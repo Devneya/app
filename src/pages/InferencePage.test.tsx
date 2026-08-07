@@ -67,7 +67,26 @@ describe("InferencePage", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/Status:/)).toHaveTextContent("active");
+      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: $0.42 / $5.00");
+      expect(screen.getByRole("progressbar", { name: "Usage progress" })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Cancel subscription" })).toBeInTheDocument();
+    });
+  });
+
+  it("cancels subscription and shows cancelled status", async () => {
+    setMockSubscribed(true);
+    renderApp("/login");
+    const user = await signInViaUi();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Cancel subscription" })).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "Cancel subscription" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Status:/)).toHaveTextContent("cancelled");
+      expect(screen.queryByRole("button", { name: "Cancel subscription" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Subscribe" })).toBeInTheDocument();
     });
   });
 

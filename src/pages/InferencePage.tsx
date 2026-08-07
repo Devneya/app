@@ -11,6 +11,7 @@ import {
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { useAuth } from "@/auth/useAuth";
 import { cancelSubscription, fetchUsage, fetchVirtualKey, startSubscription } from "@/api/account";
+import type { UsageResponse } from "@/api/types";
 import { fetchModels } from "@/api/models";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
@@ -27,6 +28,17 @@ function formatUsd(value: number): string {
     return `$${value.toFixed(digits)}`;
   }
   return `$${value.toFixed(2)}`;
+}
+
+function formatAccessUntil(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return iso;
+  }
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 export function InferencePage() {
@@ -64,8 +76,18 @@ export function InferencePage() {
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelSubscription(token),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["usage"] });
+    onSuccess: (data) => {
+      // Prod keeps subscription_status "active" until period end (cancel_at_period_end).
+      // Apply the cancel response so the UI updates immediately.
+      queryClient.setQueryData<UsageResponse>(["usage", token], (current) =>
+        current
+          ? {
+              ...current,
+              subscription_status: "cancelled",
+              access_until: data.access_until,
+            }
+          : current
+      );
     },
   });
 
@@ -73,6 +95,8 @@ export function InferencePage() {
   const usagePercent =
     usage && usage.limit > 0 ? Math.min(100, (usage.used / usage.limit) * 100) : 0;
   const models = modelsQuery.data?.data ?? [];
+  const status = usage?.subscription_status;
+  const accessUntil = usage?.access_until;
 
   async function copyKey() {
     if (!keyQuery.data?.key) {
@@ -139,18 +163,46 @@ export function InferencePage() {
             ) : (
               <Stack spacing={2}>
                 <Typography>
-                  Status: <strong>{usage.subscription_status}</strong>
+                  Status: <strong>{status}</strong>
                 </Typography>
-                <Typography>
-                  Spent {formatUsd(usage.used)} of {formatUsd(usage.limit)} this period
-                </Typography>
-                <LinearProgress
-                  variant="determinate"
-                  value={usagePercent}
-                  aria-label="Usage progress"
-                />
+                {status === "cancelled" && accessUntil ? (
+                  <Typography variant="body2" color="text.secondary">
+                    Access until {formatAccessUntil(accessUntil)}
+                  </Typography>
+                ) : null}
+                <Box>
+                  <Typography sx={{ mb: 1 }}>
+                    Spent: {formatUsd(usage.used)} / {formatUsd(usage.limit)}
+                  </Typography>
+                  <Box
+                    role="progressbar"
+                    aria-label="Usage progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(usagePercent)}
+                    aria-valuetext={`${formatUsd(usage.used)} of ${formatUsd(usage.limit)}`}
+                    sx={{
+                      height: 8,
+                      bgcolor: brand.soft,
+                      border: `1px solid ${brand.hairline}`,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <Box
+                      sx={{
+                        height: "100%",
+                        width: `${usagePercent}%`,
+                        // Keep a visible marker once any spend exists (true % can be << 1%).
+                        minWidth: usage.used > 0 ? 4 : 0,
+                        maxWidth: "100%",
+                        bgcolor: brand.yellow,
+                        transition: "width 200ms ease-out",
+                      }}
+                    />
+                  </Box>
+                </Box>
                 <Stack direction="row" spacing={2}>
-                  {usage.subscription_status === "none" ? (
+                  {status === "none" || status === "cancelled" ? (
                     <Button
                       variant="contained"
                       onClick={() => subscribeMutation.mutate()}
@@ -159,7 +211,7 @@ export function InferencePage() {
                       Subscribe
                     </Button>
                   ) : null}
-                  {usage.subscription_status === "active" ? (
+                  {status === "active" ? (
                     <Button
                       variant="outlined"
                       color="warning"

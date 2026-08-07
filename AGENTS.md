@@ -25,6 +25,15 @@ All must pass. Do not rely on manual browser review alone.
 - MSW handlers live in `src/mocks/handlers/` — keep shapes aligned with `Devneya/control-plane/docs/openapi.yaml`.
 - Reset mock state between tests via `resetMockSession()` / `setMockSubscribed()`.
 
+### Coverage TODO (2026-08-07)
+
+Increase tests for recent auth/inference work — tracked in
+`control-plane/docs/open-items.md`:
+
+- `AuthConfirmPage` (success / error hash states)
+- Sub-cent usage formatting (`formatUsd` must not round tiny spend to `$0.00`)
+- Signup / email-change `emailRedirectTo` → `/auth/confirm` (mock or e2e)
+
 ## Mock credentials (MSW mode)
 
 - Email: `demo@devneya.com`
