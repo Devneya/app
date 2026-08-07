@@ -16,7 +16,16 @@ import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
 
+/** Format USD for usage UI. Tiny spends must not round to "$0.00". */
 function formatUsd(value: number): string {
+  if (!Number.isFinite(value) || value === 0) {
+    return "$0.00";
+  }
+  const abs = Math.abs(value);
+  if (abs < 0.01) {
+    const digits = Math.min(6, Math.max(4, Math.ceil(-Math.log10(abs)) + 1));
+    return `$${value.toFixed(digits)}`;
+  }
   return `$${value.toFixed(2)}`;
 }
 
