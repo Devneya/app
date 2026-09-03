@@ -3,7 +3,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "@/test/render";
 import { MOCK_MODELS, MOCK_USER, MOCK_VIRTUAL_KEY } from "@/mocks/data";
-import { setMockSubscribed } from "@/mocks/handlers";
+import { setMockBillingState, setMockSubscribed } from "@/mocks/handlers";
 
 async function signInViaUi() {
   const user = userEvent.setup();
@@ -67,7 +67,7 @@ describe("InferencePage", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/Status:/)).toHaveTextContent("active");
-      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: $0.42 / $5.00");
+      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: $0.42 / $10.00");
       expect(screen.getByRole("progressbar", { name: "Usage progress" })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Cancel subscription" })).toBeInTheDocument();
     });
@@ -87,7 +87,25 @@ describe("InferencePage", () => {
       expect(screen.getByText(/Status:/)).toHaveTextContent("active");
       expect(screen.getByText(/Cancellation scheduled/i)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Cancel subscription" })).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Resubscribe" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Keep subscription" })).toBeInTheDocument();
+    });
+  });
+
+  it.each([
+    ["past_due", "update_payment", "button", "Update payment method"],
+    ["review_required", "contact_support", "alert", "Billing requires support review."],
+    ["pending", "none", "alert", "Payment confirmation is pending."],
+    ["deleting", "none", "alert", "Account deletion is in progress."],
+    ["expired", "subscribe", "button", "Subscribe"],
+  ] as const)("renders the %s billing state", async (status, action, role, label) => {
+    setMockBillingState(status, action);
+    renderApp("/login");
+    await signInViaUi();
+
+    await waitFor(() => {
+      const element =
+        role === "button" ? screen.getByRole("button", { name: label }) : screen.getByText(label);
+      expect(element).toBeInTheDocument();
     });
   });
 

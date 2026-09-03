@@ -19,10 +19,11 @@ type AuthContextValue = {
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<SignUpResult>;
+  signInWithProvider: (provider: "google" | "github") => Promise<void>;
   signOut: () => Promise<void>;
   resetPasswordForEmail: (email: string) => Promise<void>;
   updatePassword: (password: string) => Promise<void>;
-  changePassword: (currentPassword: string, nextPassword: string) => Promise<void>;
+  changePassword: (currentPassword: string, nextPassword: string) => Promise<string>;
   updateDisplayName: (name: string) => Promise<void>;
   updateEmail: (email: string) => Promise<void>;
 };
@@ -85,15 +86,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { needsEmailConfirmation: !data.session };
   }, []);
 
-  const signOut = useCallback(async () => {
-    const { error } = await supabase.auth.signOut({ scope: "global" });
-    if (!error) {
-      return;
+  const signInWithProvider = useCallback(async (provider: "google" | "github") => {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider,
+      options: { redirectTo: appOrigin() },
+    });
+    if (error) {
+      throw error;
     }
-    // If the remote revoke fails (offline / mock gap / 403), still clear local session.
-    const { error: localError } = await supabase.auth.signOut({ scope: "local" });
-    if (localError) {
-      throw localError;
+  }, []);
+
+  const signOut = useCallback(async () => {
+    const { error } = await supabase.auth.signOut({ scope: "local" });
+    if (error) {
+      throw error;
     }
   }, []);
 
@@ -119,17 +125,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!email) {
         throw new Error("Not signed in");
       }
-      const { error: reauthError } = await supabase.auth.signInWithPassword({
+      const { data, error: reauthError } = await supabase.auth.signInWithPassword({
         email,
         password: currentPassword,
       });
       if (reauthError) {
         throw reauthError;
       }
+      if (!data.session) {
+        throw new Error("Reauthentication did not return a session");
+      }
       const { error } = await supabase.auth.updateUser({ password: nextPassword });
       if (error) {
         throw error;
       }
+      return data.session.access_token;
     },
     [session?.user?.email]
   );
@@ -164,6 +174,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       signIn,
       signUp,
+      signInWithProvider,
       signOut,
       resetPasswordForEmail,
       updatePassword,
@@ -176,6 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       signIn,
       signUp,
+      signInWithProvider,
       signOut,
       resetPasswordForEmail,
       updatePassword,

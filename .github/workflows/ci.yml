@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
@@ -52,14 +52,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run build
         env:
           VITE_USE_MOCKS: "false"
           VITE_API_BASE_URL: https://api.devneya.com
-          VITE_GOTRUE_ANON_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.VITE_GOTRUE_ANON_KEY || 'placeholder' }}
+          VITE_GOTRUE_ANON_KEY: ${{ github.event_name == 'pull_request' && 'ci-build-key' || secrets.VITE_GOTRUE_ANON_KEY }}
       - uses: actions/upload-artifact@v4
         with:
           name: dist

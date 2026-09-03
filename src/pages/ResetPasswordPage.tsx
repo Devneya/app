@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
+import { logout } from "@/api/account";
 import { AuthShell } from "@/components/AuthShell";
 import { supabase } from "@/supabase";
 
 export function ResetPasswordPage() {
-  const { session, updatePassword } = useAuth();
+  const { session, updatePassword, signOut } = useAuth();
   const navigate = useNavigate();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -20,16 +21,10 @@ export function ResetPasswordPage() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((event) => {
-      if (event === "PASSWORD_RECOVERY" || event === "SIGNED_IN") {
+      if (event === "PASSWORD_RECOVERY") {
         if (active) {
           setReady(true);
         }
-      }
-    });
-
-    void supabase.auth.getSession().then(({ data }) => {
-      if (active && data.session) {
-        setReady(true);
       }
     });
 
@@ -53,8 +48,14 @@ export function ResetPasswordPage() {
     setSubmitting(true);
     try {
       await updatePassword(password);
+      if (!session?.access_token) {
+        throw new Error("Recovery session is missing.");
+      }
+      await logout(session.access_token);
+      await signOut();
+      sessionStorage.setItem("devneya.passwordChanged", "1");
       setDone(true);
-      navigate("/", { replace: true });
+      navigate("/login", { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update password");
     } finally {
@@ -69,9 +70,9 @@ export function ResetPasswordPage() {
   return (
     <AuthShell
       title="Choose a new password"
-      subtitle="Use at least 6 characters. You’ll stay signed in after saving."
+      subtitle="Use at least 6 characters. Sign in again after saving."
     >
-      {!ready && !session ? (
+      {!ready ? (
         <Stack spacing={2}>
           <Alert severity="info">
             Open the reset link from your email to continue. If the link expired, request a

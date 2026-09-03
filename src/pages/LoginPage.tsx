@@ -29,7 +29,7 @@ function defaultDemoCredentials(): { email: string; password: string } {
 }
 
 export function LoginPage() {
-  const { session, signIn, signUp } = useAuth();
+  const { session, signIn, signUp, signInWithProvider } = useAuth();
   const [passwordChanged] = useState(() => {
     if (typeof sessionStorage === "undefined") {
       return false;
@@ -98,6 +98,17 @@ export function LoginPage() {
     }
   }
 
+  async function handleProvider(provider: "google" | "github") {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await signInWithProvider(provider);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Authentication failed");
+      setSubmitting(false);
+    }
+  }
+
   return (
     <AuthShell
       title={mode === "signin" ? "Sign in" : "Create account"}
@@ -137,6 +148,22 @@ export function LoginPage() {
           ) : null}
           <Button type="submit" variant="contained" size="large" disabled={submitting}>
             {mode === "signin" ? "Sign in" : "Create account"}
+          </Button>
+          <Button
+            type="button"
+            variant="outlined"
+            disabled={submitting}
+            onClick={() => void handleProvider("google")}
+          >
+            Continue with Google
+          </Button>
+          <Button
+            type="button"
+            variant="outlined"
+            disabled={submitting}
+            onClick={() => void handleProvider("github")}
+          >
+            Continue with GitHub
           </Button>
         </Stack>
       </Box>

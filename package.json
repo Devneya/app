@@ -3,10 +3,13 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.build.json && vite build",
-    "postbuild": "cp dist/index.html dist/404.html",
+    "postbuild": "bash scripts/static-routes.sh",
     "typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.app.json --noEmit",
     "lint": "eslint src tests --max-warnings 0",
     "test": "vitest run",

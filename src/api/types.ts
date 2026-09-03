@@ -1,19 +1,30 @@
-export type SubscriptionStatus = "none" | "active" | "cancelled" | string;
+export type SubscriptionStatus =
+  | "none"
+  | "pending"
+  | "active"
+  | "past_due"
+  | "cancelled"
+  | "expired"
+  | "review_required"
+  | "deleting";
 
 export type UsageResponse = {
   used: number;
   limit: number;
   subscription_status: SubscriptionStatus;
-  /** Present after cancel-at-period-end; client may also stash from cancel response. */
+  entitlement_status: SubscriptionStatus;
+  cancel_at_period_end: boolean;
   access_until?: string;
+  required_billing_action: "subscribe" | "none" | "uncancel" | "update_payment" | "contact_support";
 };
 
 export type SubscribeResponse =
   | { status: "active" }
-  | { status: "checkout"; checkout_url: string };
+  | { status: "checkout"; checkout_url: string; expires_at: string };
 
 export type CancelSubscriptionResponse = {
   status: string;
+  cancel_at_period_end: boolean;
   access_until?: string;
 };
 
@@ -21,9 +32,7 @@ export type KeyResponse = {
   key: string;
 };
 
-export type ApiError = {
-  error: string;
-};
+export type ApiError = { error: { code: string; message: string; request_id: string } };
 
 export type ModelObject = {
   id: string;

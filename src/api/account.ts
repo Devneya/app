@@ -20,8 +20,19 @@ async function apiFetch<T>(
     },
   });
   if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`${path} failed (${resp.status}): ${body}`);
+    let message = `Request failed (${resp.status}).`;
+    try {
+      const body = (await resp.json()) as { error?: { message?: string }; retry_at?: string };
+      if (body.error?.message) {
+        message = body.error.message;
+      }
+      if (body.retry_at) {
+        message += ` Retry after ${new Date(body.retry_at).toLocaleString()}.`;
+      }
+    } catch {
+      // Keep the safe status-only message for non-JSON responses.
+    }
+    throw new Error(message);
   }
   return resp.json() as Promise<T>;
 }
@@ -48,6 +59,18 @@ export function cancelSubscription(
   return apiFetch<CancelSubscriptionResponse>("/account/subscribe/cancel", accessToken, {
     method: "POST",
   });
+}
+
+export function uncancelSubscription(
+  accessToken: string
+): Promise<CancelSubscriptionResponse> {
+  return apiFetch<CancelSubscriptionResponse>("/account/subscribe/uncancel", accessToken, {
+    method: "POST",
+  });
+}
+
+export function createBillingPortal(accessToken: string): Promise<{ portal_url: string }> {
+  return apiFetch("/account/billing/portal", accessToken, { method: "POST" });
 }
 
 export function logout(accessToken: string): Promise<{ status: string }> {

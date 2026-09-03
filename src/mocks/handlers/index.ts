@@ -1,5 +1,6 @@
 import { http, HttpResponse } from "msw";
 import { authBaseUrl, config } from "@/config";
+import type { SubscriptionStatus, UsageResponse } from "@/api/types";
 import {
   createDefaultMockSession,
   getMockEmail,
@@ -21,15 +22,29 @@ import {
 
 let session: MockSession = createDefaultMockSession();
 let mockPassword = MOCK_USER.password;
+let billingOverride: {
+  status: SubscriptionStatus;
+  action: UsageResponse["required_billing_action"];
+  cancelAtPeriodEnd: boolean;
+} | null = null;
 
 export function resetMockSession(): void {
   session = createDefaultMockSession();
   mockPassword = MOCK_USER.password;
+  billingOverride = null;
   resetMockUserMetadata();
 }
 
 export function setMockSubscribed(value: boolean): void {
   session.subscribed = value;
+}
+
+export function setMockBillingState(
+  status: SubscriptionStatus,
+  action: UsageResponse["required_billing_action"],
+  cancelAtPeriodEnd = false
+): void {
+  billingOverride = { status, action, cancelAtPeriodEnd };
 }
 
 export function getMockPassword(): string {
@@ -164,12 +179,19 @@ export const accountHandlers = [
       return unauthorized();
     }
     // Mirror prod cancel-at-period-end: still "active" with access_until until the period ends.
-    const status = session.subscribed ? "active" : "none";
+    const status = billingOverride?.status ?? (session.subscribed ? "active" : "none");
+    const cancelAtPeriodEnd = billingOverride?.cancelAtPeriodEnd ?? session.cancelled;
+    const requiredBillingAction =
+      billingOverride?.action ??
+      (session.cancelled ? "uncancel" : session.subscribed ? "none" : "subscribe");
     return HttpResponse.json({
-      limit: 5,
+      limit: 10,
       used: session.subscribed ? 0.42 : 0,
       subscription_status: status,
-      ...(session.subscribed && session.cancelled
+      entitlement_status: status,
+      cancel_at_period_end: cancelAtPeriodEnd,
+      required_billing_action: requiredBillingAction,
+      ...(cancelAtPeriodEnd
         ? { access_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() }
         : {}),
     });
@@ -196,8 +218,20 @@ export const accountHandlers = [
     const accessUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     return HttpResponse.json({
       status: "cancelled",
+      cancel_at_period_end: true,
       access_until: accessUntil,
     });
+  }),
+
+  http.post(`${apiBase}/account/subscribe/uncancel`, ({ request }) => {
+    if (!requireAuth(request)) return unauthorized();
+    session.cancelled = false;
+    return HttpResponse.json({ status: "active", cancel_at_period_end: false });
+  }),
+
+  http.post(`${apiBase}/account/billing/portal`, ({ request }) => {
+    if (!requireAuth(request)) return unauthorized();
+    return HttpResponse.json({ portal_url: MOCK_CHECKOUT_URL });
   }),
 
   http.post(`${apiBase}/account/logout`, ({ request }) => {

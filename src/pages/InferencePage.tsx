@@ -10,15 +10,18 @@ import {
 } from "@mui/material";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { useAuth } from "@/auth/useAuth";
-import { cancelSubscription, fetchUsage, fetchVirtualKey, startSubscription } from "@/api/account";
-import type { UsageResponse } from "@/api/types";
+import {
+  cancelSubscription,
+  createBillingPortal,
+  fetchUsage,
+  fetchVirtualKey,
+  startSubscription,
+  uncancelSubscription,
+} from "@/api/account";
 import { fetchModels } from "@/api/models";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
-
-/** Survives Dodo checkout round-trips until /account/usage exposes access_until. */
-const CANCEL_ACCESS_UNTIL_KEY = "devneya.cancelAccessUntil";
 
 /** Format USD for usage UI. Tiny spends must not round to "$0.00". */
 function formatUsd(value: number): string {
@@ -44,62 +47,21 @@ function formatAccessUntil(iso: string): string {
   });
 }
 
-function readStoredAccessUntil(): string | undefined {
-  try {
-    const raw = sessionStorage.getItem(CANCEL_ACCESS_UNTIL_KEY);
-    if (!raw) {
-      return undefined;
-    }
-    const at = Date.parse(raw);
-    if (Number.isNaN(at) || at <= Date.now()) {
-      sessionStorage.removeItem(CANCEL_ACCESS_UNTIL_KEY);
-      return undefined;
-    }
-    return raw;
-  } catch {
-    return undefined;
-  }
-}
-
-function storeAccessUntil(iso: string | undefined): void {
-  try {
-    if (!iso) {
-      sessionStorage.removeItem(CANCEL_ACCESS_UNTIL_KEY);
-      return;
-    }
-    sessionStorage.setItem(CANCEL_ACCESS_UNTIL_KEY, iso);
-  } catch {
-    // ignore quota / private mode
-  }
-}
-
-function mergeUsageAccessUntil(usage: UsageResponse): UsageResponse {
-  if (usage.access_until) {
-    storeAccessUntil(usage.access_until);
-    return usage;
-  }
-  if (usage.subscription_status !== "active") {
-    storeAccessUntil(undefined);
-    return usage;
-  }
-  const stored = readStoredAccessUntil();
-  return stored ? { ...usage, access_until: stored } : usage;
-}
-
 export function InferencePage() {
   const { session } = useAuth();
   const queryClient = useQueryClient();
   const token = session?.access_token ?? "";
+  const userID = session?.user.id ?? "";
 
   const keyQuery = useQuery({
-    queryKey: ["virtualKey", token],
+    queryKey: ["virtualKey", userID],
     queryFn: () => fetchVirtualKey(token),
     enabled: Boolean(token),
   });
 
   const usageQuery = useQuery({
-    queryKey: ["usage", token],
-    queryFn: async () => mergeUsageAccessUntil(await fetchUsage(token)),
+    queryKey: ["usage", userID],
+    queryFn: () => fetchUsage(token),
     enabled: Boolean(token),
   });
 
@@ -115,39 +77,24 @@ export function InferencePage() {
         window.location.href = data.checkout_url;
         return;
       }
-      storeAccessUntil(undefined);
-      void queryClient.invalidateQueries({ queryKey: ["usage"] });
+      void queryClient.invalidateQueries({ queryKey: ["usage", userID] });
     },
   });
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelSubscription(token),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["usage", userID] }),
+  });
+
+  const uncancelMutation = useMutation({
+    mutationFn: () => uncancelSubscription(token),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["usage", userID] }),
+  });
+
+  const portalMutation = useMutation({
+    mutationFn: () => createBillingPortal(token),
     onSuccess: (data) => {
-      // Cancel response status "cancelled" means the cancel was accepted.
-      // With access_until, paid access continues — usage stays "active" until then.
-      if (data.access_until) {
-        storeAccessUntil(data.access_until);
-        queryClient.setQueryData<UsageResponse>(["usage", token], (current) =>
-          current
-            ? {
-                ...current,
-                subscription_status: "active",
-                access_until: data.access_until,
-              }
-            : current
-        );
-        return;
-      }
-      storeAccessUntil(undefined);
-      queryClient.setQueryData<UsageResponse>(["usage", token], (current) =>
-        current
-          ? {
-              ...current,
-              subscription_status: "cancelled",
-              access_until: undefined,
-            }
-          : current
-      );
+      window.location.href = data.portal_url;
     },
   });
 
@@ -156,8 +103,9 @@ export function InferencePage() {
     usage && usage.limit > 0 ? Math.min(100, (usage.used / usage.limit) * 100) : 0;
   const models = modelsQuery.data?.data ?? [];
   const status = usage?.subscription_status;
+  const billingAction = usage?.required_billing_action;
   const accessUntil = usage?.access_until;
-  const cancelScheduled = status === "active" && Boolean(accessUntil);
+  const cancelScheduled = billingAction === "uncancel";
 
   async function copyKey() {
     if (!keyQuery.data?.key) {
@@ -166,7 +114,11 @@ export function InferencePage() {
     await navigator.clipboard.writeText(keyQuery.data.key);
   }
 
-  const actionError = subscribeMutation.error ?? cancelMutation.error;
+  const actionError =
+    subscribeMutation.error ??
+    cancelMutation.error ??
+    uncancelMutation.error ??
+    portalMutation.error;
 
   return (
     <>
@@ -228,7 +180,8 @@ export function InferencePage() {
                 </Typography>
                 {cancelScheduled ? (
                   <Typography variant="body2" color="text.secondary">
-                    Cancellation scheduled. Access until {formatAccessUntil(accessUntil!)}.
+                    Cancellation scheduled.
+                    {accessUntil ? ` Access until ${formatAccessUntil(accessUntil)}.` : ""}
                   </Typography>
                 ) : null}
                 <Box>
@@ -263,7 +216,7 @@ export function InferencePage() {
                   </Box>
                 </Box>
                 <Stack direction="row" spacing={2}>
-                  {status === "none" || status === "cancelled" ? (
+                  {billingAction === "subscribe" ? (
                     <Button
                       variant="contained"
                       onClick={() => subscribeMutation.mutate()}
@@ -275,13 +228,13 @@ export function InferencePage() {
                   {cancelScheduled ? (
                     <Button
                       variant="contained"
-                      onClick={() => subscribeMutation.mutate()}
-                      disabled={subscribeMutation.isPending}
+                      onClick={() => uncancelMutation.mutate()}
+                      disabled={uncancelMutation.isPending}
                     >
-                      Resubscribe
+                      Keep subscription
                     </Button>
                   ) : null}
-                  {status === "active" && !cancelScheduled ? (
+                  {status === "active" && billingAction === "none" ? (
                     <Button
                       variant="outlined"
                       color="warning"
@@ -291,7 +244,25 @@ export function InferencePage() {
                       Cancel subscription
                     </Button>
                   ) : null}
+                  {billingAction === "update_payment" ? (
+                    <Button
+                      variant="contained"
+                      onClick={() => portalMutation.mutate()}
+                      disabled={portalMutation.isPending}
+                    >
+                      Update payment method
+                    </Button>
+                  ) : null}
                 </Stack>
+                {status === "pending" ? (
+                  <Alert severity="info">Payment confirmation is pending.</Alert>
+                ) : null}
+                {billingAction === "contact_support" ? (
+                  <Alert severity="warning">Billing requires support review.</Alert>
+                ) : null}
+                {status === "deleting" ? (
+                  <Alert severity="warning">Account deletion is in progress.</Alert>
+                ) : null}
               </Stack>
             )}
           </Section>

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Alert, Box, Button, Container, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
@@ -16,6 +16,7 @@ function readSavedName(session: ReturnType<typeof useAuth>["session"]): string {
 export function AccountPage() {
   const { session, signOut, changePassword, updateDisplayName, updateEmail } = useAuth();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const token = session?.access_token ?? "";
   const accountEmail = session?.user?.email ?? "";
   const savedName = readSavedName(session);
@@ -80,6 +81,7 @@ export function AccountPage() {
     mutationFn: async () => {
       await deleteAccount(token);
       await signOut();
+      queryClient.clear();
     },
     onSuccess: () => navigate("/login"),
   });
@@ -92,14 +94,11 @@ export function AccountPage() {
       if (nextPassword !== confirmPassword) {
         throw new Error("Passwords do not match.");
       }
-      await changePassword(currentPassword, nextPassword);
-      try {
-        await logout(token);
-      } catch {
-        // Still sign out locally even if revoke fails.
-      }
+      const currentToken = await changePassword(currentPassword, nextPassword);
+      await logout(currentToken);
       sessionStorage.setItem("devneya.passwordChanged", "1");
       await signOut();
+      queryClient.clear();
     },
     onSuccess: () => {
       navigate("/login", { replace: true });
@@ -271,7 +270,9 @@ export function AccountPage() {
           <Box sx={{ pt: 2 }}>
             <Section title="Danger zone" danger>
               <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                Permanently delete your account and API key. This cannot be undone.
+                Permanently delete your account and API key. An already-open checkout may
+                still accept payment afterward, but that payment will not recreate your
+                account or access and Devneya will not compensate it.
               </Typography>
               {!deleteOpen ? (
                 <Button

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AppBar, Box, Button, Menu, MenuItem, Toolbar, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
 import { logout } from "@/api/account";
@@ -31,6 +31,7 @@ const navLinkSx = (active: boolean) => ({
 export function AppChrome({ section }: { section: "inference" | "account" }) {
   const { session, signOut } = useAuth();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const label = accountLabel(session);
   const token = session?.access_token ?? "";
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -38,12 +39,9 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
 
   const logoutMutation = useMutation({
     mutationFn: async () => {
-      try {
-        await logout(token);
-      } catch {
-        // Still clear local session if server revoke fails.
-      }
+      await logout(token);
       await signOut();
+      queryClient.clear();
     },
     onSuccess: () => navigate("/login"),
   });
@@ -85,6 +83,16 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         >
           LLM inference
         </Typography>
+        {logoutMutation.error ? (
+          <Button
+            color="error"
+            size="small"
+            disabled={logoutMutation.isPending}
+            onClick={() => logoutMutation.mutate()}
+          >
+            Logout failed — retry
+          </Button>
+        ) : null}
         {label ? (
           <>
             <Button
