@@ -4,6 +4,7 @@ import type {
   SubscribeResponse,
   UsageResponse,
 } from "@/api/types";
+import { throwApiRequestError } from "@/api/errors";
 import { config } from "@/config";
 
 async function apiFetch<T>(
@@ -20,19 +21,7 @@ async function apiFetch<T>(
     },
   });
   if (!resp.ok) {
-    let message = `Request failed (${resp.status}).`;
-    try {
-      const body = (await resp.json()) as { error?: { message?: string }; retry_at?: string };
-      if (body.error?.message) {
-        message = body.error.message;
-      }
-      if (body.retry_at) {
-        message += ` Retry after ${new Date(body.retry_at).toLocaleString()}.`;
-      }
-    } catch {
-      // Keep the safe status-only message for non-JSON responses.
-    }
-    throw new Error(message);
+    await throwApiRequestError(resp);
   }
   return resp.json() as Promise<T>;
 }

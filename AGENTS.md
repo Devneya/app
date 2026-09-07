@@ -7,6 +7,10 @@ Instructions for AI agents working in `Devneya/app`.
 Primary Devneya web UI: sign-in, virtual API key, usage/subscription management.
 Calls `api.devneya.com` (GoTrue + `devneya-api`). Not the archived playground canvas app.
 
+Project-wide KISS, DRY, least-surprise, user-responsibility, and caller-result rules are
+canonical in [control-plane/AGENTS.md](https://github.com/Devneya/control-plane/blob/main/AGENTS.md).
+Apply those rules to this repository's UI and integrations.
+
 ## Before claiming done
 
 Run all gates locally:

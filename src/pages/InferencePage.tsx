@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -50,6 +51,7 @@ function formatAccessUntil(iso: string): string {
 export function InferencePage() {
   const { session } = useAuth();
   const queryClient = useQueryClient();
+  const [copyError, setCopyError] = useState<string | null>(null);
   const token = session?.access_token ?? "";
   const userID = session?.user.id ?? "";
 
@@ -111,7 +113,16 @@ export function InferencePage() {
     if (!keyQuery.data?.key) {
       return;
     }
-    await navigator.clipboard.writeText(keyQuery.data.key);
+    setCopyError(null);
+    if (!navigator.clipboard) {
+      setCopyError("Clipboard access is unavailable.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(keyQuery.data.key);
+    } catch (error) {
+      setCopyError(error instanceof Error ? error.message : "Clipboard access was denied.");
+    }
   }
 
   const actionError =
@@ -131,6 +142,7 @@ export function InferencePage() {
               {actionError instanceof Error ? actionError.message : "Request failed"}
             </Alert>
           ) : null}
+          {copyError ? <Alert severity="error">Could not copy API key: {copyError}</Alert> : null}
 
           <Section title="API key">
             {keyQuery.isLoading ? (

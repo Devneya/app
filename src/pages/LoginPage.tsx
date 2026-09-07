@@ -29,7 +29,7 @@ function defaultDemoCredentials(): { email: string; password: string } {
 }
 
 export function LoginPage() {
-  const { session, signIn, signUp, signInWithProvider } = useAuth();
+  const { session, initializationError, signIn, signUp, signInWithProvider } = useAuth();
   const [passwordChanged] = useState(() => {
     if (typeof sessionStorage === "undefined") {
       return false;
@@ -118,6 +118,9 @@ export function LoginPage() {
         <Stack spacing={2}>
           {passwordChanged ? (
             <Alert severity="success">Password updated. Sign in with your new password.</Alert>
+          ) : null}
+          {initializationError ? (
+            <Alert severity="error">Could not load your session: {initializationError.message}</Alert>
           ) : null}
           {error ? <Alert severity="error">{error}</Alert> : null}
           <TextField

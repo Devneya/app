@@ -17,6 +17,7 @@ export type SignUpResult = {
 type AuthContextValue = {
   session: Session | null;
   loading: boolean;
+  initializationError: Error | null;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<SignUpResult>;
   signInWithProvider: (provider: "google" | "github") => Promise<void>;
@@ -48,21 +49,40 @@ function confirmRedirectTo(): string {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [initializationError, setInitializationError] = useState<Error | null>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setLoading(false);
-    });
+    let mounted = true;
+    supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!mounted) return;
+        if (error) {
+          setInitializationError(error);
+        }
+        setSession(data.session);
+        setLoading(false);
+      })
+      .catch((error: unknown) => {
+        if (!mounted) return;
+        setInitializationError(error instanceof Error ? error : new Error("Session lookup failed"));
+        setLoading(false);
+      });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession);
+      if (nextSession) {
+        setInitializationError(null);
+      }
       setLoading(false);
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
   const signIn = useCallback(async (email: string, password: string) => {
@@ -172,6 +192,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       session,
       loading,
+      initializationError,
       signIn,
       signUp,
       signInWithProvider,
@@ -185,6 +206,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       session,
       loading,
+      initializationError,
       signIn,
       signUp,
       signInWithProvider,
