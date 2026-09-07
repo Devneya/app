@@ -32,9 +32,6 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 function appOrigin(): string {
-  if (typeof window === "undefined") {
-    return "https://app.devneya.com";
-  }
   return window.location.origin;
 }
 
