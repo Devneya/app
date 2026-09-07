@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Alert, Box, Button, Container, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
 import { deleteAccount, logout } from "@/api/account";
+import { describeError } from "@/api/errors";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
@@ -12,6 +13,8 @@ function readSavedName(session: ReturnType<typeof useAuth>["session"]): string {
   const name = session?.user?.user_metadata?.name;
   return typeof name === "string" ? name : "";
 }
+
+type PasswordStage = "none" | "password_changed" | "backend_logged_out";
 
 export function AccountPage() {
   const { session, signOut, changePassword, updateDisplayName, updateEmail } = useAuth();
@@ -35,6 +38,9 @@ export function AccountPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteEmail, setDeleteEmail] = useState("");
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deletionCompleted, setDeletionCompleted] = useState(false);
+  const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
+  const passwordLogoutTokenRef = useRef<string | null>(null);
 
   const profileMutation = useMutation({
     mutationFn: async () => {
@@ -79,7 +85,10 @@ export function AccountPage() {
 
   const deleteMutation = useMutation({
     mutationFn: async () => {
-      await deleteAccount(token);
+      if (!deletionCompleted) {
+        await deleteAccount(token);
+        setDeletionCompleted(true);
+      }
       await signOut();
       queryClient.clear();
     },
@@ -88,17 +97,32 @@ export function AccountPage() {
 
   const passwordMutation = useMutation({
     mutationFn: async () => {
-      if (nextPassword.length < 6) {
-        throw new Error("Password must be at least 6 characters.");
+      let stage = passwordStage;
+      if (stage === "none") {
+        if (nextPassword.length < 6) {
+          throw new Error("Password must be at least 6 characters.");
+        }
+        if (nextPassword !== confirmPassword) {
+          throw new Error("Passwords do not match.");
+        }
+        passwordLogoutTokenRef.current = await changePassword(currentPassword, nextPassword);
+        stage = "password_changed";
+        setPasswordStage(stage);
       }
-      if (nextPassword !== confirmPassword) {
-        throw new Error("Passwords do not match.");
+      if (stage === "password_changed") {
+        const currentToken = passwordLogoutTokenRef.current;
+        if (!currentToken) {
+          throw new Error("Password change recovery state is missing.");
+        }
+        await logout(currentToken);
+        stage = "backend_logged_out";
+        setPasswordStage(stage);
       }
-      const currentToken = await changePassword(currentPassword, nextPassword);
-      await logout(currentToken);
-      sessionStorage.setItem("devneya.passwordChanged", "1");
-      await signOut();
-      queryClient.clear();
+      if (stage === "backend_logged_out") {
+        await signOut();
+        queryClient.clear();
+        sessionStorage.setItem("devneya.passwordChanged", "1");
+      }
     },
     onSuccess: () => {
       navigate("/login", { replace: true });
@@ -116,11 +140,11 @@ export function AccountPage() {
       <Container maxWidth="md" sx={{ mt: 4, mb: 6 }}>
         <Stack spacing={3}>
           {deleteMutation.error ? (
-            <Alert severity="error">
-              {deleteMutation.error instanceof Error
-                ? deleteMutation.error.message
-                : "Request failed"}
-            </Alert>
+            !deletionCompleted ? (
+              <Alert severity="error">
+                {describeError(deleteMutation.error, "Could not delete account")}
+              </Alert>
+            ) : null
           ) : null}
 
           <Section title="Profile">
@@ -135,9 +159,7 @@ export function AccountPage() {
             >
               {profileMutation.error ? (
                 <Alert severity="error">
-                  {profileMutation.error instanceof Error
-                    ? profileMutation.error.message
-                    : "Could not save profile"}
+                  {describeError(profileMutation.error, "Could not save profile")}
                 </Alert>
               ) : null}
               {profileMessage ? (
@@ -206,43 +228,53 @@ export function AccountPage() {
               >
                 {passwordMutation.error ? (
                   <Alert severity="error">
-                    {passwordMutation.error instanceof Error
-                      ? passwordMutation.error.message
-                      : "Could not change password"}
+                    {passwordStage === "backend_logged_out"
+                      ? `Password changed and backend logout completed, but local sign-out failed: ${describeError(passwordMutation.error)}`
+                      : passwordStage === "password_changed"
+                        ? `Password changed, but backend logout failed: ${describeError(passwordMutation.error)}`
+                        : describeError(passwordMutation.error, "Could not change password")}
                   </Alert>
                 ) : null}
-                <TextField
-                  label="Current password"
-                  type="password"
-                  autoComplete="current-password"
-                  required
-                  fullWidth
-                  value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
-                />
-                <TextField
-                  label="New password"
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  fullWidth
-                  slotProps={{ htmlInput: { minLength: 6 } }}
-                  value={nextPassword}
-                  onChange={(e) => setNextPassword(e.target.value)}
-                />
-                <TextField
-                  label="Confirm new password"
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  fullWidth
-                  slotProps={{ htmlInput: { minLength: 6 } }}
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                />
+                {passwordStage === "none" ? (
+                  <>
+                    <TextField
+                      label="Current password"
+                      type="password"
+                      autoComplete="current-password"
+                      required
+                      fullWidth
+                      value={currentPassword}
+                      onChange={(e) => setCurrentPassword(e.target.value)}
+                    />
+                    <TextField
+                      label="New password"
+                      type="password"
+                      autoComplete="new-password"
+                      required
+                      fullWidth
+                      slotProps={{ htmlInput: { minLength: 6 } }}
+                      value={nextPassword}
+                      onChange={(e) => setNextPassword(e.target.value)}
+                    />
+                    <TextField
+                      label="Confirm new password"
+                      type="password"
+                      autoComplete="new-password"
+                      required
+                      fullWidth
+                      slotProps={{ htmlInput: { minLength: 6 } }}
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                    />
+                  </>
+                ) : null}
                 <Stack direction="row" spacing={1.5}>
                   <Button type="submit" variant="contained" disabled={passwordMutation.isPending}>
-                    Save new password
+                    {passwordStage === "none"
+                      ? "Save new password"
+                      : passwordStage === "password_changed"
+                        ? "Finish password change"
+                        : "Finish local sign-out"}
                   </Button>
                   <Button
                     type="button"
@@ -251,10 +283,12 @@ export function AccountPage() {
                     disabled={passwordMutation.isPending}
                     onClick={() => {
                       setChangePasswordOpen(false);
-                      setCurrentPassword("");
-                      setNextPassword("");
-                      setConfirmPassword("");
-                      passwordMutation.reset();
+                      if (passwordStage === "none") {
+                        setCurrentPassword("");
+                        setNextPassword("");
+                        setConfirmPassword("");
+                        passwordMutation.reset();
+                      }
                     }}
                   >
                     Cancel
@@ -274,7 +308,24 @@ export function AccountPage() {
                 still accept payment afterward, but that payment will not recreate your
                 account or access and Devneya will not compensate it.
               </Typography>
-              {!deleteOpen ? (
+              {deletionCompleted ? (
+                <Stack spacing={2}>
+                  <Alert severity="warning">
+                    Account deletion completed, but local sign-out failed. Finish local
+                    sign-out to leave this account.
+                    {deleteMutation.error ? ` ${describeError(deleteMutation.error)}` : ""}
+                  </Alert>
+                  <Button
+                    variant="contained"
+                    color="warning"
+                    disabled={deleteMutation.isPending}
+                    onClick={() => deleteMutation.mutate()}
+                    sx={{ alignSelf: "flex-start" }}
+                  >
+                    Finish local sign-out
+                  </Button>
+                </Stack>
+              ) : !deleteOpen ? (
                 <Button
                   variant="outlined"
                   color="inherit"

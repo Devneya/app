@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { Session } from "@supabase/supabase-js";
+import type { Session, User } from "@supabase/supabase-js";
 import { supabase } from "@/supabase";
 
 export type SignUpResult = {
@@ -44,6 +44,24 @@ function recoveryRedirectTo(): string {
 
 function confirmRedirectTo(): string {
   return `${appOrigin()}/auth/confirm`;
+}
+
+type UserAttributes = Parameters<typeof supabase.auth.updateUser>[0];
+type UserUpdateOptions = Parameters<typeof supabase.auth.updateUser>[1];
+
+async function updateUserChecked(
+  attributes: UserAttributes,
+  options: UserUpdateOptions | undefined,
+  operation: string
+): Promise<User> {
+  const { data, error } = await supabase.auth.updateUser(attributes, options);
+  if (error) {
+    throw error;
+  }
+  if (!data.user) {
+    throw new Error(`${operation} did not return a user.`);
+  }
+  return data.user;
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -86,9 +104,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signIn = useCallback(async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) {
       throw error;
+    }
+    if (!data.session) {
+      throw new Error("Sign-in did not return a session.");
     }
   }, []);
 
@@ -107,12 +128,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signInWithProvider = useCallback(async (provider: "google" | "github") => {
-    const { error } = await supabase.auth.signInWithOAuth({
+    const { data, error } = await supabase.auth.signInWithOAuth({
       provider,
       options: { redirectTo: appOrigin() },
     });
     if (error) {
       throw error;
+    }
+    if (!data.url) {
+      throw new Error("Provider sign-in did not return a redirect URL.");
     }
   }, []);
 
@@ -133,10 +157,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const updatePassword = useCallback(async (password: string) => {
-    const { error } = await supabase.auth.updateUser({ password });
-    if (error) {
-      throw error;
-    }
+    await updateUserChecked({ password }, undefined, "Password update");
   }, []);
 
   const changePassword = useCallback(
@@ -155,10 +176,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!data.session) {
         throw new Error("Reauthentication did not return a session");
       }
-      const { error } = await supabase.auth.updateUser({ password: nextPassword });
-      if (error) {
-        throw error;
-      }
+      await updateUserChecked({ password: nextPassword }, undefined, "Password update");
       return data.session.access_token;
     },
     [session?.user?.email]
@@ -166,11 +184,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const updateDisplayName = useCallback(async (name: string) => {
     const trimmed = name.trim();
-    const { error } = await supabase.auth.updateUser({
-      data: { name: trimmed },
-    });
-    if (error) {
-      throw error;
+    const user = await updateUserChecked({ data: { name: trimmed } }, undefined, "Name update");
+    if (user.user_metadata?.name !== trimmed) {
+      throw new Error("Profile update did not return the saved name.");
     }
   }, []);
 
@@ -179,13 +195,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!trimmed) {
       throw new Error("Email is required");
     }
-    const { error } = await supabase.auth.updateUser(
+    await updateUserChecked(
       { email: trimmed },
-      { emailRedirectTo: confirmRedirectTo() }
+      { emailRedirectTo: confirmRedirectTo() },
+      "Email update"
     );
-    if (error) {
-      throw error;
-    }
   }, []);
 
   const value = useMemo(

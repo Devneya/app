@@ -41,6 +41,16 @@ export class ApiRequestError extends Error {
   }
 }
 
+export function describeError(error: unknown, fallback = "Request failed"): string {
+  if (!(error instanceof Error) || !error.message || error.message === "{}") {
+    return fallback;
+  }
+  if (error instanceof ApiRequestError && error.requestId) {
+    return `${error.message} (Request ID: ${error.requestId})`;
+  }
+  return error.message;
+}
+
 export async function throwApiRequestError(response: Response): Promise<never> {
   let responseText: string;
   try {

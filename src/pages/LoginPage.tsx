@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Navigate, Link as RouterLink } from "react-router-dom";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
+import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
 import { config } from "@/config";
 
@@ -92,7 +93,7 @@ export function LoginPage() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Authentication failed");
+      setError(describeError(err, "Authentication failed"));
     } finally {
       setSubmitting(false);
     }
@@ -104,7 +105,7 @@ export function LoginPage() {
     try {
       await signInWithProvider(provider);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Authentication failed");
+      setError(describeError(err, "Authentication failed"));
       setSubmitting(false);
     }
   }

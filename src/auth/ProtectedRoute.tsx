@@ -1,10 +1,9 @@
-import { Navigate, useLocation } from "react-router-dom";
+import { Navigate } from "react-router-dom";
 import { useAuth } from "@/auth/useAuth";
 import { Alert, CircularProgress, Box } from "@mui/material";
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { session, loading, initializationError } = useAuth();
-  const location = useLocation();
 
   if (loading) {
     return (
@@ -23,7 +22,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   }
 
   if (!session) {
-    return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+    return <Navigate to="/login" replace />;
   }
 
   return children;

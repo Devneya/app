@@ -19,22 +19,23 @@ import {
   startSubscription,
   uncancelSubscription,
 } from "@/api/account";
+import { describeError } from "@/api/errors";
 import { fetchModels } from "@/api/models";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
 
-/** Format USD for usage UI. Tiny spends must not round to "$0.00". */
-function formatUsd(value: number): string {
+/** Format EUR for usage UI. Tiny spends must not round to "€0.00". */
+function formatEur(value: number): string {
   if (!Number.isFinite(value) || value === 0) {
-    return "$0.00";
+    return "€0.00";
   }
   const abs = Math.abs(value);
   if (abs < 0.01) {
     const digits = Math.min(6, Math.max(4, Math.ceil(-Math.log10(abs)) + 1));
-    return `$${value.toFixed(digits)}`;
+    return `€${value.toFixed(digits)}`;
   }
-  return `$${value.toFixed(2)}`;
+  return `€${value.toFixed(2)}`;
 }
 
 function formatAccessUntil(iso: string): string {
@@ -75,11 +76,7 @@ export function InferencePage() {
   const subscribeMutation = useMutation({
     mutationFn: () => startSubscription(token),
     onSuccess: (data) => {
-      if (data.status === "checkout" && "checkout_url" in data) {
-        window.location.href = data.checkout_url;
-        return;
-      }
-      void queryClient.invalidateQueries({ queryKey: ["usage", userID] });
+      window.location.href = data.checkout_url;
     },
   });
 
@@ -104,7 +101,7 @@ export function InferencePage() {
   const usagePercent =
     usage && usage.limit > 0 ? Math.min(100, (usage.used / usage.limit) * 100) : 0;
   const models = modelsQuery.data?.data ?? [];
-  const status = usage?.subscription_status;
+  const status = usage?.entitlement_status;
   const billingAction = usage?.required_billing_action;
   const accessUntil = usage?.access_until;
   const cancelScheduled = billingAction === "uncancel";
@@ -121,7 +118,7 @@ export function InferencePage() {
     try {
       await navigator.clipboard.writeText(keyQuery.data.key);
     } catch (error) {
-      setCopyError(error instanceof Error ? error.message : "Clipboard access was denied.");
+      setCopyError(describeError(error, "Clipboard access was denied."));
     }
   }
 
@@ -139,7 +136,7 @@ export function InferencePage() {
         <Stack spacing={3}>
           {actionError ? (
             <Alert severity="error">
-              {actionError instanceof Error ? actionError.message : "Request failed"}
+              {describeError(actionError)}
             </Alert>
           ) : null}
           {copyError ? <Alert severity="error">Could not copy API key: {copyError}</Alert> : null}
@@ -148,7 +145,9 @@ export function InferencePage() {
             {keyQuery.isLoading ? (
               <LinearProgress aria-label="Loading API key" />
             ) : keyQuery.error ? (
-              <Alert severity="error">Could not load API key</Alert>
+              <Alert severity="error">
+                {describeError(keyQuery.error, "Could not load API key")}
+              </Alert>
             ) : (
               <Stack
                 direction={{ xs: "column", sm: "row" }}
@@ -184,7 +183,9 @@ export function InferencePage() {
             {usageQuery.isLoading ? (
               <LinearProgress aria-label="Loading usage" />
             ) : usageQuery.error || !usage ? (
-              <Alert severity="error">Could not load usage</Alert>
+              <Alert severity="error">
+                {describeError(usageQuery.error, "Could not load usage")}
+              </Alert>
             ) : (
               <Stack spacing={2}>
                 <Typography>
@@ -198,7 +199,7 @@ export function InferencePage() {
                 ) : null}
                 <Box>
                   <Typography sx={{ mb: 1 }}>
-                    Spent: {formatUsd(usage.used)} / {formatUsd(usage.limit)}
+                    Spent: {formatEur(usage.used)} / {formatEur(usage.limit)}
                   </Typography>
                   <Box
                     role="progressbar"
@@ -206,7 +207,7 @@ export function InferencePage() {
                     aria-valuemin={0}
                     aria-valuemax={100}
                     aria-valuenow={Math.round(usagePercent)}
-                    aria-valuetext={`${formatUsd(usage.used)} of ${formatUsd(usage.limit)}`}
+                    aria-valuetext={`${formatEur(usage.used)} of ${formatEur(usage.limit)}`}
                     sx={{
                       height: 8,
                       bgcolor: brand.soft,
@@ -272,9 +273,6 @@ export function InferencePage() {
                 {billingAction === "contact_support" ? (
                   <Alert severity="warning">Billing requires support review.</Alert>
                 ) : null}
-                {status === "deleting" ? (
-                  <Alert severity="warning">Account deletion is in progress.</Alert>
-                ) : null}
               </Stack>
             )}
           </Section>
@@ -283,7 +281,9 @@ export function InferencePage() {
             {modelsQuery.isLoading ? (
               <LinearProgress aria-label="Loading models" />
             ) : modelsQuery.error ? (
-              <Alert severity="error">Could not load models</Alert>
+              <Alert severity="error">
+                {describeError(modelsQuery.error, "Could not load models")}
+              </Alert>
             ) : models.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 No models available right now.

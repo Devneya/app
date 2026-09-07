@@ -5,8 +5,7 @@ export type SubscriptionStatus =
   | "past_due"
   | "cancelled"
   | "expired"
-  | "review_required"
-  | "deleting";
+  | "review_required";
 
 export type UsageResponse = {
   used: number;
@@ -14,18 +13,20 @@ export type UsageResponse = {
   subscription_status: SubscriptionStatus;
   entitlement_status: SubscriptionStatus;
   cancel_at_period_end: boolean;
-  access_until?: string;
+  access_until: string | null;
   required_billing_action: "subscribe" | "none" | "uncancel" | "update_payment" | "contact_support";
 };
 
-export type SubscribeResponse =
-  | { status: "active" }
-  | { status: "checkout"; checkout_url: string; expires_at: string };
+export type SubscribeResponse = {
+  status: "checkout";
+  checkout_url: string;
+  expires_at: string;
+};
 
 export type CancelSubscriptionResponse = {
   status: string;
   cancel_at_period_end: boolean;
-  access_until?: string;
+  access_until: string | null;
 };
 
 export type KeyResponse = {

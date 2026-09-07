@@ -1,9 +1,13 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
 import { renderApp } from "@/test/render";
 import { MOCK_MODELS, MOCK_USER, MOCK_VIRTUAL_KEY } from "@/mocks/data";
 import { setMockBillingState, setMockSubscribed } from "@/mocks/handlers";
+import { config } from "@/config";
+import { server } from "@/mocks/server";
+import { supabase } from "@/supabase";
 
 async function signInViaUi() {
   const user = userEvent.setup();
@@ -67,7 +71,7 @@ describe("InferencePage", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/Status:/)).toHaveTextContent("active");
-      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: $0.42 / $10.00");
+      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: €0.42 / €10.00");
       expect(screen.getByRole("progressbar", { name: "Usage progress" })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Cancel subscription" })).toBeInTheDocument();
     });
@@ -95,7 +99,6 @@ describe("InferencePage", () => {
     ["past_due", "update_payment", "button", "Update payment method"],
     ["review_required", "contact_support", "alert", "Billing requires support review."],
     ["pending", "none", "alert", "Payment confirmation is pending."],
-    ["deleting", "none", "alert", "Account deletion is in progress."],
     ["expired", "subscribe", "button", "Subscribe"],
   ] as const)("renders the %s billing state", async (status, action, role, label) => {
     setMockBillingState(status, action);
@@ -141,5 +144,38 @@ describe("InferencePage", () => {
         screen.getByRole("button", { name: new RegExp(`Account menu: ${MOCK_USER.email}`, "i") })
       ).toHaveTextContent("Demo User");
     });
+  });
+
+  it("does not repeat backend logout after local sign-out fails", async () => {
+    let logoutRequests = 0;
+    server.use(
+      http.post(`${config.apiBaseUrl}/account/logout`, () => {
+        logoutRequests += 1;
+        return HttpResponse.json({ status: "logged_out" });
+      })
+    );
+    const realSignOut = supabase.auth.signOut.bind(supabase.auth);
+    vi.spyOn(supabase.auth, "signOut")
+      .mockRejectedValueOnce(new Error("Local sign-out unavailable"))
+      .mockImplementation(() => realSignOut({ scope: "local" }));
+
+    renderApp("/login");
+    const user = await signInViaUi();
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Log out" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Backend logout completed, but local sign-out failed"
+      );
+      expect(screen.getByRole("button", { name: "Finish local sign-out" })).toBeInTheDocument();
+    });
+    expect(logoutRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "Finish local sign-out" }));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    });
+    expect(logoutRequests).toBe(1);
   });
 });

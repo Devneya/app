@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link as RouterLink } from "react-router-dom";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
+import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
 
 export function ForgotPasswordPage() {
@@ -19,14 +20,7 @@ export function ForgotPasswordPage() {
       await resetPasswordForEmail(email);
       setSent(true);
     } catch (err) {
-      // Avoid email enumeration: still show success for typical "user not found"
-      // responses from GoTrue, but surface unexpected failures.
-      const message = err instanceof Error ? err.message : "Request failed";
-      if (/rate limit|network|fetch/i.test(message)) {
-        setError(message);
-      } else {
-        setSent(true);
-      }
+      setError(describeError(err, "Could not send reset link"));
     } finally {
       setSubmitting(false);
     }

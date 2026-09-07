@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AppBar, Box, Button, Menu, MenuItem, Toolbar, Typography } from "@mui/material";
+import { Alert, AppBar, Box, Button, Menu, MenuItem, Toolbar, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
 import { logout } from "@/api/account";
+import { describeError } from "@/api/errors";
 import { brand } from "@/theme";
 
 function accountLabel(session: ReturnType<typeof useAuth>["session"]): string | null {
@@ -35,11 +36,15 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
   const label = accountLabel(session);
   const token = session?.access_token ?? "";
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const [logoutCompleted, setLogoutCompleted] = useState(false);
   const menuOpen = Boolean(menuAnchor);
 
   const logoutMutation = useMutation({
     mutationFn: async () => {
-      await logout(token);
+      if (!logoutCompleted) {
+        await logout(token);
+        setLogoutCompleted(true);
+      }
       await signOut();
       queryClient.clear();
     },
@@ -51,16 +56,17 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
   }
 
   return (
-    <AppBar
-      position="static"
-      color="transparent"
-      elevation={0}
-      sx={{
-        bgcolor: brand.canvas,
-        borderBottom: `1px solid ${brand.hairline}`,
-      }}
-    >
-      <Toolbar sx={{ gap: 2, minHeight: 56 }}>
+    <>
+      <AppBar
+        position="static"
+        color="transparent"
+        elevation={0}
+        sx={{
+          bgcolor: brand.canvas,
+          borderBottom: `1px solid ${brand.hairline}`,
+        }}
+      >
+        <Toolbar sx={{ gap: 2, minHeight: 56 }}>
         <Typography variant="body2" component="div" sx={{ flexGrow: 1, fontWeight: 500 }}>
           <Box
             component={RouterLink}
@@ -83,16 +89,16 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         >
           LLM inference
         </Typography>
-        {logoutMutation.error ? (
-          <Button
-            color="error"
-            size="small"
-            disabled={logoutMutation.isPending}
-            onClick={() => logoutMutation.mutate()}
-          >
-            Logout failed — retry
-          </Button>
-        ) : null}
+          {logoutMutation.error ? (
+            <Button
+              color="error"
+              size="small"
+              disabled={logoutMutation.isPending}
+              onClick={() => logoutMutation.mutate()}
+            >
+              {logoutCompleted ? "Finish local sign-out" : "Logout failed — retry"}
+            </Button>
+          ) : null}
         {label ? (
           <>
             <Button
@@ -162,7 +168,15 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
             </Menu>
           </>
         ) : null}
-      </Toolbar>
-    </AppBar>
+        </Toolbar>
+      </AppBar>
+      {logoutMutation.error ? (
+        <Alert severity="error" sx={{ borderRadius: 0 }}>
+          {logoutCompleted
+            ? `Backend logout completed, but local sign-out failed: ${describeError(logoutMutation.error)}`
+            : `Could not log out: ${describeError(logoutMutation.error)}`}
+        </Alert>
+      ) : null}
+    </>
   );
 }

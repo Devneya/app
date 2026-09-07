@@ -17,6 +17,9 @@ implementation or review. Remove confirmed over-engineering; retain required
 authorization, integrity, and effect verification. Failed or unverified actions
 stop dependent work and reach the caller without becoming success.
 
+Apply the same rules to tests and helpers: cover documented behavior and
+demonstrated defects, reuse fixtures, and avoid speculative cases or machinery.
+
 ## Before claiming done
 
 Run all gates locally:

@@ -68,7 +68,7 @@ function requireAuth(request: Request): string | null {
 }
 
 const authBase = authBaseUrl();
-const apiBase = config.apiBaseUrl.replace(/\/$/, "");
+const apiBase = config.apiBaseUrl;
 
 export const authHandlers = [
   http.post(`${authBase}/signup`, async ({ request }) => {
@@ -184,6 +184,9 @@ export const accountHandlers = [
     const requiredBillingAction =
       billingOverride?.action ??
       (session.cancelled ? "uncancel" : session.subscribed ? "none" : "subscribe");
+    const accessUntil = cancelAtPeriodEnd
+      ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+      : null;
     return HttpResponse.json({
       limit: 10,
       used: session.subscribed ? 0.42 : 0,
@@ -191,9 +194,7 @@ export const accountHandlers = [
       entitlement_status: status,
       cancel_at_period_end: cancelAtPeriodEnd,
       required_billing_action: requiredBillingAction,
-      ...(cancelAtPeriodEnd
-        ? { access_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() }
-        : {}),
+      access_until: accessUntil,
     });
   }),
 
@@ -202,11 +203,21 @@ export const accountHandlers = [
       return unauthorized();
     }
     if (session.subscribed && !session.cancelled) {
-      return HttpResponse.json({ status: "active" });
+      return HttpResponse.json(
+        {
+          error: {
+            code: "subscription_active",
+            message: "Subscription is already active.",
+            request_id: "mock-subscription-active",
+          },
+        },
+        { status: 409 }
+      );
     }
     return HttpResponse.json({
       status: "checkout",
       checkout_url: MOCK_CHECKOUT_URL,
+      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
     });
   }),
 
@@ -226,7 +237,7 @@ export const accountHandlers = [
   http.post(`${apiBase}/account/subscribe/uncancel`, ({ request }) => {
     if (!requireAuth(request)) return unauthorized();
     session.cancelled = false;
-    return HttpResponse.json({ status: "active", cancel_at_period_end: false });
+    return HttpResponse.json({ status: "active", cancel_at_period_end: false, access_until: null });
   }),
 
   http.post(`${apiBase}/account/billing/portal`, ({ request }) => {
