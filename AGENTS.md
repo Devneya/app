@@ -7,9 +7,15 @@ Instructions for AI agents working in `Devneya/app`.
 Primary Devneya web UI: sign-in, virtual API key, usage/subscription management.
 Calls `api.devneya.com` (GoTrue + `devneya-api`). Not the archived playground canvas app.
 
-Project-wide KISS, DRY, least-surprise, user-responsibility, and caller-result rules are
-canonical in [control-plane/AGENTS.md](https://github.com/Devneya/control-plane/blob/main/AGENTS.md).
-Apply those rules to this repository's UI and integrations.
+The hard architecture and implementation rules in
+[control-plane/AGENTS.md](https://github.com/Devneya/control-plane/blob/main/AGENTS.md)
+apply to this repository's UI and integrations: KISS, DRY, YAGNI, least surprise,
+user responsibility, no speculative fail-closed gates, direct checks of every
+callee's errors and required outputs, complete error/output propagation with
+safe diagnostics, and verified synchronous operations. Read that section before
+implementation or review. Remove confirmed over-engineering; retain required
+authorization, integrity, and effect verification. Failed or unverified actions
+stop dependent work and reach the caller without becoming success.
 
 ## Before claiming done
 
@@ -26,7 +32,7 @@ All must pass. Do not rely on manual browser review alone.
 - **Unit/component**: Vitest + React Testing Library in `*.test.tsx` next to the component.
 - **E2E**: Playwright in `tests/e2e/mock/` against MSW-backed preview build.
 - Prefer `getByRole` / `getByLabelText`. Use `data-testid` only when no accessible name exists.
-- MSW handlers live in `src/mocks/handlers/` — keep shapes aligned with `Devneya/control-plane/docs/openapi.yaml`.
+- MSW handlers live in `src/mocks/handlers/` — keep shapes aligned with `Devneya/api/openapi.yaml`.
 - Reset mock state between tests via `resetMockSession()` / `setMockSubscribed()`.
 
 ### Coverage TODO (2026-08-07)
