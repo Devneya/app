@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, remediation-staging-2026-09-03]
   pull_request:
     branches: [main]
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -25,7 +25,13 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run test
+      - run: npm run test -- --reporter=default --reporter=junit --outputFile.junit=unit-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-results
+          path: unit-results.xml
+          if-no-files-found: error
 
   e2e:
     runs-on: ubuntu-latest
@@ -44,6 +50,12 @@ jobs:
           VITE_USE_MOCKS: "true"
           VITE_API_BASE_URL: https://api.devneya.com
           VITE_GOTRUE_ANON_KEY: mock-anon-key
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-results
+          path: test-results/
+          if-no-files-found: warn
 
   build:
     runs-on: ubuntu-latest
@@ -59,7 +71,7 @@ jobs:
         env:
           VITE_USE_MOCKS: "false"
           VITE_API_BASE_URL: https://api.devneya.com
-          VITE_GOTRUE_ANON_KEY: ${{ github.event_name == 'pull_request' && 'ci-build-key' || secrets.VITE_GOTRUE_ANON_KEY }}
+          VITE_GOTRUE_ANON_KEY: ${{ github.ref != 'refs/heads/main' && 'ci-build-key' || secrets.VITE_GOTRUE_ANON_KEY }}
       - uses: actions/upload-artifact@v4
         with:
           name: dist
