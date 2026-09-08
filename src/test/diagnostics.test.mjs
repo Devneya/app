@@ -46,6 +46,9 @@ describe("browser diagnostics", () => {
     expect(output).toContain("nested cause");
     expect(output).not.toContain("secret-token");
     expect(output).not.toContain("secret-password");
+    expect(safeUrl("https://test.checkout.dodopayments.com/opaqueCheckout")).not.toContain("opaqueCheckout");
+    expect(safeText('"forterToken":"private-fraud-token"')).not.toContain("private-fraud-token");
+    expect(safeBody({ forterToken: "private-fraud-token", sessionId: "cks_private-session" })).toEqual({ forterToken: "[redacted]", sessionId: "[redacted-capability]" });
     const basic = safeText("Authorization: Basic dXNlcjpzZWNyZXQ=");
     expect(basic).toContain("[redacted]");
     expect(basic).not.toContain("dXNlcjpzZWNyZXQ=");

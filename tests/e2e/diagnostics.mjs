@@ -64,6 +64,9 @@ export function safeUrl(value) {
   try {
     const url = new URL(String(value));
     const query = safeUrlQuery(url);
+    if (/(^|\.)checkout\.dodopayments\.com$/.test(url.hostname) && /^\/[^/.]+\/?$/.test(url.pathname)) {
+      return `${url.origin}/[redacted-capability]${query ? `?${query}` : ""}`;
+    }
     return `${url.origin}${safeUrlPath(url.pathname)}${query ? `?${query}` : ""}`;
   } catch {
     return "[invalid-url]";
@@ -72,11 +75,13 @@ export function safeUrl(value) {
 
 export function safeText(value) {
   return String(value)
+    .replace(/\b(?:cks|cs)_[A-Za-z0-9_-]+/g, "[redacted-capability]")
     .replace(/https?:\/\/[^\s\\"<>]+/g, (url) => safeUrl(url))
     .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [redacted]")
     .replace(/\bBasic\s+[^\s"']+/gi, "Basic [redacted]")
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted-token]")
     .replace(/sk-bf-[A-Za-z0-9_-]+/g, "[redacted-key]")
+    .replace(/(["'][\w-]*token["']\s*:\s*)["'][^"']*["']/gi, '$1"[redacted]"')
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
     .replace(/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, (digits) =>
       isLikelyCard(digits) ? "[redacted-card]" : digits
@@ -141,7 +146,7 @@ export function safeBody(value, seen = new WeakSet()) {
   const output = {};
   for (const [key, item] of Object.entries(value)) {
     const numericValue = key.toLowerCase() === "value" && typeof item === "number";
-    output[key] = SENSITIVE_KEY.test(key) && !numericValue
+    output[key] = (SENSITIVE_KEY.test(key) || /token$/i.test(key)) && !numericValue
       ? "[redacted]"
       : safeBody(item, seen);
   }
