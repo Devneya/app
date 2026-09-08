@@ -20,6 +20,13 @@ stop dependent work and reach the caller without becoming success.
 Apply the same rules to tests and helpers: cover documented behavior and
 demonstrated defects, reuse fixtures, and avoid speculative cases or machinery.
 
+CRITICALLY IMPORTANT: for every failure, retain the complete safe message and relevant log, identify
+the evidence-backed root cause or state the exact unknown and needed evidence,
+compare remediation options with their tradeoffs, choose and verify the fix,
+and record the decision in `control-plane/docs/troubleshooting-decisions.md`.
+Capture successful output as well as failures from browser console/network and helper
+commands; record collection failures; redact credentials and private data.
+
 ## Before claiming done
 
 Run all gates locally:
