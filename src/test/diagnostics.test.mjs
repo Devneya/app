@@ -164,6 +164,39 @@ describe("browser diagnostics", () => {
     expect(JSON.stringify(failures)).not.toContain("secret-token");
   });
 
+  it("records 3xx bodies as unavailable under the Playwright response contract", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, value) => observations.push({ kind, ...value }),
+      addFailure: (value) => failures.push(value),
+    });
+    const request = fakeRequest({ method: () => "GET", postData: () => null });
+    let bodyRead = false;
+    await page.emit("response", {
+      request: () => request,
+      url: () => "https://app.stage.devneya.com/login",
+      status: () => 308,
+      allHeaders: async () => ({ location: "/login/", "content-type": "text/html" }),
+      body: async () => {
+        bodyRead = true;
+        throw new Error("response body is unavailable for redirect responses");
+      },
+    });
+    await Promise.all(pending);
+
+    expect(observations[0].body).toEqual({
+      unavailable: true,
+      reason: "Playwright does not expose response bodies for 3xx responses",
+    });
+    expect(observations[0].headers.location).toBe("/login/");
+    expect(bodyRead).toBe(false);
+    expect(failures).toHaveLength(0);
+  });
+
   it("stores binary response bytes privately instead of decoding them as text", async () => {
     const page = fakePage();
     const observations = [];

@@ -254,12 +254,18 @@ async function captureResponse(response, options) {
     context,
     options.addFailure
   );
-  const responseBodyTask = collect(
-    "response body",
-    () => (typeof response.body === "function" ? response.body() : response.text()),
-    context,
-    options.addFailure
-  );
+  const redirectResponse = context.status >= 300 && context.status <= 399;
+  const responseBodyTask = redirectResponse
+    ? Promise.resolve({
+        unavailable: true,
+        reason: "Playwright does not expose response bodies for 3xx responses",
+      })
+    : collect(
+        "response body",
+        () => (typeof response.body === "function" ? response.body() : response.text()),
+        context,
+        options.addFailure
+      );
   const [responseHeaders, responseBody] = await Promise.all([responseHeadersTask, responseBodyTask]);
   const contentType = Object.entries(responseHeaders ?? {}).find(
     ([key]) => key.toLowerCase() === "content-type"
