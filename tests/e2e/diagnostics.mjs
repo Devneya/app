@@ -265,6 +265,8 @@ export async function drainBeforeClose(pending) {
   }
 }
 
+export const MOCK_RESPONSE_CAPTURE_HOOK = "__devneyaCaptureMockResponse";
+
 async function captureResponse(response, options) {
   const request = response.request();
   const url = safeUrl(response.url());

@@ -6,8 +6,10 @@ import {
   drainPending,
   drainBeforeClose,
   configurePageCapture,
+  MOCK_RESPONSE_CAPTURE_HOOK,
   safeBody,
   safeError,
+  safeText,
 } from "./diagnostics.mjs";
 
 type DiagnosticFixtures = {
@@ -29,6 +31,55 @@ export const test = base.extend<DiagnosticFixtures>({
         const safeValue = safeBody(value);
         failures.push({ ...(safeValue as Record<string, unknown>), at: new Date().toISOString() });
       };
+      const recordMockedResponse = (payload: unknown) => {
+        const data = payload && typeof payload === "object"
+          ? payload as Record<string, unknown>
+          : {};
+        const context = {
+          requestId: data.requestId,
+          method: data.method,
+          status: data.status,
+          url: data.url,
+        };
+        if (data.kind === "error") {
+          addFailure({
+            kind: "diagnostic-collection",
+            operation: "MSW mocked response",
+            ...context,
+            error: safeError(data.error),
+          });
+          return;
+        }
+        if (
+          data.kind !== "response" ||
+          typeof data.requestId !== "string" ||
+          typeof data.method !== "string" ||
+          typeof data.url !== "string" ||
+          !Number.isInteger(data.status) ||
+          typeof data.body !== "string"
+        ) {
+          addFailure({
+            kind: "diagnostic-collection",
+            operation: "MSW mocked response",
+            ...context,
+            error: safeError(new Error("MSW mocked response capture payload omitted response metadata or body.")),
+          });
+          return;
+        }
+        let body: unknown;
+        try {
+          body = safeBody(JSON.parse(data.body));
+        } catch {
+          body = safeText(data.body);
+        }
+        record("http", {
+          ...context,
+          headers: safeBody(data.headers),
+          body,
+          fromServiceWorker: true,
+          captureSource: "msw-response:mocked",
+        });
+      };
       let testFailure: unknown;
       try {
         record("diagnostic-config", await configurePageCapture(page));
@@ -41,6 +92,20 @@ export const test = base.extend<DiagnosticFixtures>({
         };
         failures.push(failure);
         testFailure = error;
+      }
+      if (!testFailure) {
+        try {
+          await page.exposeFunction(MOCK_RESPONSE_CAPTURE_HOOK, recordMockedResponse);
+          record("diagnostic-config", { mswResponseCapture: "response:mocked binding" });
+        } catch (error) {
+          failures.push({
+            kind: "diagnostic-collection",
+            operation: "install MSW response capture binding",
+            error: safeError(error),
+            at: new Date().toISOString(),
+          });
+          testFailure = error;
+        }
       }
       const removeDiagnostics = installPageDiagnostics(page, {
         record,
@@ -55,6 +120,18 @@ export const test = base.extend<DiagnosticFixtures>({
           testFailure ??= error;
         }
       }
+      const mockDrain = page.evaluate(async () => {
+        const drain = (globalThis as typeof globalThis & {
+          __devneyaDrainMockResponses?: () => Promise<void>;
+        }).__devneyaDrainMockResponses;
+        if (drain) await drain();
+      });
+      pending.push(mockDrain);
+      mockDrain.catch((error) => addFailure({
+        kind: "diagnostic-collection",
+        operation: "drain MSW mocked responses",
+        error: safeError(error),
+      }));
       const beforeClose = await drainBeforeClose(pending);
       try {
         removeDiagnostics();
