@@ -4,6 +4,8 @@ import { test as base } from "@playwright/test";
 import {
   installPageDiagnostics,
   drainPending,
+  drainBeforeClose,
+  configurePageCapture,
   safeBody,
   safeError,
 } from "./diagnostics.mjs";
@@ -27,14 +29,44 @@ export const test = base.extend<DiagnosticFixtures>({
         const safeValue = safeBody(value);
         failures.push({ ...(safeValue as Record<string, unknown>), at: new Date().toISOString() });
       };
-      installPageDiagnostics(page, { record, addFailure, pending, binaryArtifactDir });
       let testFailure: unknown;
       try {
-        await useFixture();
+        record("diagnostic-config", await configurePageCapture(page));
       } catch (error) {
+        const failure = {
+          kind: "diagnostic-collection",
+          operation: "configure browser capture",
+          error: safeError(error),
+          at: new Date().toISOString(),
+        };
+        failures.push(failure);
         testFailure = error;
       }
-      const drainBeforeClose = await drainPending(pending);
+      const removeDiagnostics = installPageDiagnostics(page, {
+        record,
+        addFailure,
+        pending,
+        binaryArtifactDir,
+      });
+      if (!testFailure) {
+        try {
+          await useFixture();
+        } catch (error) {
+          testFailure ??= error;
+        }
+      }
+      const beforeClose = await drainBeforeClose(pending);
+      try {
+        removeDiagnostics();
+      } catch (error) {
+        failures.push({
+          kind: "diagnostic-collection",
+          operation: "remove page diagnostics listeners",
+          error: safeError(error),
+          at: new Date().toISOString(),
+        });
+        testFailure ??= error;
+      }
       try {
         await page.close();
       } catch (error) {
@@ -46,7 +78,7 @@ export const test = base.extend<DiagnosticFixtures>({
         testFailure ??= error;
       }
       const drainAfterClose = await drainPending(pending);
-      const drain = [...drainBeforeClose, ...drainAfterClose];
+      const drain = [...beforeClose, ...drainAfterClose];
       const rejected = drain.filter((result) => result.status === "rejected");
       if (rejected.length) {
         failures.push({
@@ -123,8 +155,8 @@ export const test = base.extend<DiagnosticFixtures>({
         testFailure ??= error;
       }
       const hardFailures = failures.filter((failure) => {
-        const item = failure as { kind?: unknown; expectedLifecycle?: unknown };
-        return !item.expectedLifecycle && [
+        const item = failure as { kind?: unknown };
+        return [
           "diagnostic-collection",
           "diagnostic-drain",
           "pageerror",

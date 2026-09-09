@@ -214,7 +214,8 @@ async function collect(label, read, context, addFailure) {
 }
 
 function track(pending, operation, task, context, addFailure) {
-  const tracked = Promise.resolve(task).catch((error) => {
+  const tracked = Promise.resolve(task);
+  tracked.catch((error) => {
     addFailure({
       kind: "diagnostic-collection",
       operation,
@@ -235,6 +236,32 @@ export async function drainPending(pending) {
     drained += batch.length;
   }
   return settled;
+}
+
+export async function configurePageCapture(page) {
+  const session = await page.context().newCDPSession(page);
+  const buffers = { maxTotalBufferSize: 8 * 1024 * 1024, maxResourceBufferSize: 2 * 1024 * 1024 };
+  await session.send("Network.enable");
+  await session.send("Network.setCacheDisabled", { cacheDisabled: true });
+  await session.send("Network.configureDurableMessages", buffers);
+  return { browserCache: "disabled", cacheCoverage: "not-covered", durableResponseBodies: buffers };
+}
+
+export async function drainBeforeClose(pending) {
+  let timer;
+  try {
+    return await Promise.race([
+      drainPending(pending),
+      new Promise(resolve => {
+        timer = globalThis.setTimeout(() => resolve([{
+          status: "rejected",
+          reason: new Error("Browser capture exceeded the five-second teardown window; close the page and retain remaining reader errors."),
+        }]), 5000);
+      }),
+    ]);
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
 }
 
 async function captureResponse(response, options) {
@@ -398,9 +425,11 @@ async function serializeBrowserError(handle) {
 }
 
 async function captureConsoleArg(handle) {
+  const value = await handle.jsonValue();
+  if (value === null || typeof value !== "object") return safeBody(value);
   const browserError = await serializeBrowserError(handle);
   if (browserError?.__devneyaError) return safeBody(browserError.__devneyaError);
-  return safeBody(await handle.jsonValue());
+  return safeBody(value);
 }
 
 async function captureConsole(message, options) {
@@ -486,19 +515,24 @@ export function installPageDiagnostics(
     binaryArtifactDir,
     nextBinaryArtifact: () => ++binarySequence,
   };
-  page.on("console", (message) => {
+  const listeners = new Map();
+  const listen = (event, listener) => {
+    page.on(event, listener);
+    listeners.set(event, listener);
+  };
+  listen("console", (message) => {
     track(pending, "console capture", captureConsole(message, options), {}, addFailure);
   });
-  page.on("pageerror", (error) => {
+  listen("pageerror", (error) => {
     addFailure({ kind: "pageerror", error: safeError(error) });
   });
-  page.on("crash", () => {
+  listen("crash", () => {
     addFailure({
       kind: "page-crash",
       error: { name: "PageCrash", message: "The page crashed.", stack: "" },
     });
   });
-  page.on("requestfailed", (request) => {
+  listen("requestfailed", (request) => {
     try {
       track(
         pending,
@@ -515,7 +549,7 @@ export function installPageDiagnostics(
       });
     }
   });
-  page.on("response", (response) => {
+  listen("response", (response) => {
     try {
       track(
         pending,
@@ -532,5 +566,10 @@ export function installPageDiagnostics(
       });
     }
   });
-  return pending;
+  const removeListeners = () => {
+    for (const [event, listener] of listeners) {
+      page.off(event, listener);
+    }
+  };
+  return removeListeners;
 }

@@ -1,10 +1,13 @@
 /* global Buffer */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  configurePageCapture,
+  drainPending,
+  drainBeforeClose,
   installPageDiagnostics,
   safeBody,
   safeError,
@@ -17,6 +20,9 @@ function fakePage() {
   return {
     on(kind, listener) {
       listeners.set(kind, listener);
+    },
+    off(kind, listener) {
+      if (listeners.get(kind) === listener) listeners.delete(kind);
     },
     emit(kind, value) {
       return listeners.get(kind)?.(value);
@@ -37,6 +43,22 @@ function fakeRequest(overrides = {}) {
 }
 
 describe("browser diagnostics", () => {
+  it("reports an unfinished teardown read without blocking page closure", async () => {
+    vi.useFakeTimers();
+    let finish;
+    const pending = [new Promise(resolve => { finish = resolve; })];
+    try {
+      const draining = drainBeforeClose(pending);
+      await vi.advanceTimersByTimeAsync(5000);
+      const result = await draining;
+      expect(result[0].status).toBe("rejected");
+      expect(result[0].reason.message).toContain("teardown window");
+      finish();
+      expect((await drainPending(pending))[0].status).toBe("fulfilled");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("redacts credentials while retaining exception stacks", () => {
     const error = new Error("failed with https://api.stage.devneya.com?token=secret-token");
     error.cause = new Error("nested cause");
@@ -90,7 +112,15 @@ describe("browser diagnostics", () => {
       await page.emit("console", {
         type: () => type,
         text: () => type === "log" ? "authentication succeeded" : `${type} output`,
-        args: () => [{ jsonValue: async () => ({ refresh_token: "secret-token", safe: true }) }],
+        args: () => [{
+          evaluate: async () => {
+            throw new Error("primitive console argument was evaluated");
+          },
+          jsonValue: async () => "authentication-value",
+        }, {
+          jsonValue: async () => ({ refresh_token: "secret-token", safe: true }),
+          evaluate: async (serialize) => serialize({ refresh_token: "secret-token", safe: true }),
+        }],
         location: () => ({ url: "https://api.stage.devneya.com/app.js", lineNumber: 4 }),
       });
     }
@@ -104,6 +134,7 @@ describe("browser diagnostics", () => {
       type: () => "error",
       text: () => "browser aggregate error",
       args: () => [{
+        jsonValue: async () => ({}),
         evaluate: async (serialize) => serialize(browserAggregate),
       }],
       location: () => ({ url: "https://api.stage.devneya.com/app.js", lineNumber: 5 }),
@@ -164,6 +195,31 @@ describe("browser diagnostics", () => {
     expect(JSON.stringify(failures)).not.toContain("secret-token");
   });
 
+  it("keeps top-level capture rejections visible to the drain", async () => {
+    const page = fakePage();
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: () => {},
+      addFailure: (value) => failures.push(value),
+    });
+
+    await page.emit("console", {
+      type: () => "log",
+      text: () => "console capture failed",
+      args: () => {
+        throw new Error("console arguments unavailable");
+      },
+      location: () => ({}),
+    });
+
+    const settled = await drainPending(pending);
+    expect(settled).toHaveLength(1);
+    expect(settled[0].status).toBe("rejected");
+    expect(failures[0].error.message).toContain("console arguments unavailable");
+  });
+
   it("records 3xx bodies as unavailable under the Playwright response contract", async () => {
     const page = fakePage();
     const observations = [];
@@ -195,6 +251,54 @@ describe("browser diagnostics", () => {
     expect(observations[0].headers.location).toBe("/login/");
     expect(bodyRead).toBe(false);
     expect(failures).toHaveLength(0);
+  });
+
+  it("removes listeners before page teardown", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    const removeDiagnostics = installPageDiagnostics(page, {
+      pending,
+      record: (kind, value) => observations.push({ kind, ...value }),
+      addFailure: (value) => failures.push(value),
+    });
+
+    removeDiagnostics();
+    await page.emit("console", {
+      type: () => "error",
+      text: () => "late console output",
+      args: () => [],
+      location: () => ({}),
+    });
+    await page.emit("response", {
+      request: () => fakeRequest(),
+      url: () => "https://app.stage.devneya.com/late-font.woff2",
+      status: () => 200,
+      allHeaders: async () => ({ "content-type": "font/woff2" }),
+      body: async () => Buffer.from([1, 2, 3]),
+    });
+    await Promise.all(pending);
+
+    expect(observations).toHaveLength(0);
+    expect(failures).toHaveLength(0);
+  });
+
+  it("configures uncached durable bodies through one reusable CDP setup", async () => {
+    const calls = [];
+    const session = {
+      send: async (...args) => calls.push(args),
+    };
+    const page = {
+      context: () => ({ newCDPSession: async () => session }),
+    };
+
+    await configurePageCapture(page);
+    expect(calls).toEqual([
+      ["Network.enable"],
+      ["Network.setCacheDisabled", { cacheDisabled: true }],
+      ["Network.configureDurableMessages", { maxTotalBufferSize: 8388608, maxResourceBufferSize: 2097152 }],
+    ]);
   });
 
   it("stores binary response bytes privately instead of decoding them as text", async () => {
