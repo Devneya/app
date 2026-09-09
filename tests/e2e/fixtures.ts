@@ -15,7 +15,10 @@ import {
 } from "./diagnostics.mjs";
 
 type DiagnosticFixtures = {
-  browserDiagnostics: void;
+  browserDiagnostics: {
+    observations: unknown[];
+    failures: unknown[];
+  };
 };
 
 export const test = base.extend<DiagnosticFixtures>({
@@ -125,7 +128,7 @@ export const test = base.extend<DiagnosticFixtures>({
       });
       if (!testFailure) {
         try {
-          await useFixture();
+          await useFixture({ observations, failures });
         } catch (error) {
           testFailure ??= error;
         }

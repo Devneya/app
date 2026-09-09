@@ -45,6 +45,14 @@ function fakeRequest(overrides = {}) {
 }
 
 describe("browser diagnostics", () => {
+  it("requires the exact blob source for every observed blob response", () => {
+    const response = { kind: "http", method: "GET", url: "blob:private", status: 200,
+      body: { captureSource: "blob-source", blobId: "exact-source" } };
+    const source = { kind: "blob-source", blobId: "exact-source", body: "complete source" };
+    expect(missingCdpStreamResponses([response])).toHaveLength(1);
+    expect(missingCdpStreamResponses([response, { ...source, blobId: "different-source" }])).toHaveLength(1);
+    expect(missingCdpStreamResponses([response, response, source])).toEqual([]);
+  });
   it("detects missing original mock bodies and unmatched or duplicate source records", () => {
     const response = { kind: "http", method: "GET", url: "https://example.test/account", status: 200, body: { captureSource: "msw-response:mocked" } };
     const body = { ...response, body: "complete", captureSource: "msw-response:mocked" };
@@ -353,9 +361,21 @@ describe("browser diagnostics", () => {
       ["Page.getFrameTree"],
       ["Network.enable"],
       ["Network.setCacheDisabled", { cacheDisabled: true }],
+      ["Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: false,
+        filter: [{ type: "iframe" }, { type: "worker" }, { exclude: true }] }],
     ]);
     expect(capture.cdpBodyCapture).toBe("streamResourceContent");
     capture.cdpStreams.close();
+  });
+
+  it("retains an invalid browser frame-tree result at the setup boundary", async () => {
+    const result = { unexpected: "complete provider output" };
+    const page = {
+      context: () => ({ newCDPSession: async () => ({ send: async () => result }) }),
+      exposeBinding: async () => {}, addInitScript: async () => {},
+    };
+    await expect(configurePageCapture(page, { record: () => {}, addFailure: () => {} }))
+      .rejects.toMatchObject({ message: "Page.getFrameTree returned no root frame ID", cause: result });
   });
 
   it("captures a main-frame body from request-time CDP streaming", async () => {
@@ -460,6 +480,8 @@ describe("browser diagnostics", () => {
     await drainPending(pending);
     const partial = observations.find(item => item.kind === "http" && item.url.endsWith("/partial") && item.captureSource === "cdp-stream");
     expect(partial.streamComplete).toBe(false);
+    expect(partial.bodyCaptureComplete).toBe(false);
+    expect(partial.availableBodyCaptureComplete).toBe(true);
     expect(partial.cdpStream.errors[0].message).toContain("local stream failure");
     expect(failures.some(item => item.operation === "CDP response loading")).toBe(true);
     session.emit("Network.requestWillBeSent", {
@@ -494,9 +516,7 @@ describe("browser diagnostics", () => {
     expect(fallback.bodyCaptureComplete).toBe(true);
     expect(fallback.bodyCaptureMethod).toBe("Network.getResponseBody");
     expect(fallback.cdpStream.errors[0].message).toContain("already finished loading");
-    expect(missingCdpStreamResponses(observations)).toMatchObject([
-      { response: ["GET", "https://api.example.test/partial", 200], observedResponses: 1, capturedBodies: 0 },
-    ]);
+    expect(missingCdpStreamResponses(observations)).toEqual([]);
     capture.cdpStreams.close();
   });
 
