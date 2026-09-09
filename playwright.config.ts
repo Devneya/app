@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const mockApiBaseUrl = "https://api.devneya.com";
+
 export default defineConfig({
   testDir: "tests/e2e",
   fullyParallel: true,
@@ -16,6 +18,7 @@ export default defineConfig({
   projects: [
     {
       name: "mock",
+      metadata: { mockApiBaseUrl },
       testMatch: /mock\/.*\.spec\.ts/,
     },
   ],
@@ -27,7 +30,7 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     env: {
       VITE_USE_MOCKS: "true",
-      VITE_API_BASE_URL: "https://api.devneya.com",
+      VITE_API_BASE_URL: mockApiBaseUrl,
       VITE_GOTRUE_ANON_KEY: "mock-anon-key",
     },
   },

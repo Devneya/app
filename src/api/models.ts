@@ -1,5 +1,5 @@
 import type { ModelsListResponse } from "@/api/types";
-import { throwApiRequestError } from "@/api/errors";
+import { readApiResponse } from "@/api/errors";
 import { config } from "@/config";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -9,10 +9,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Public catalog — matches GET /llm/v1/models (no auth required). */
 export async function fetchModels(): Promise<ModelsListResponse> {
   const resp = await fetch(`${config.apiBaseUrl}/llm/v1/models`);
-  if (!resp.ok) {
-    await throwApiRequestError(resp);
-  }
-  const value: unknown = await resp.json();
+  const value = await readApiResponse(resp);
   if (
     !isRecord(value) ||
     !Array.isArray(value.data) ||
@@ -23,7 +20,7 @@ export async function fetchModels(): Promise<ModelsListResponse> {
         !model.id.trim()
     )
   ) {
-    throw new Error("Models response was invalid.");
+    throw new Error("Models response was invalid.", { cause: value });
   }
   return value as ModelsListResponse;
 }

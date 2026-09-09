@@ -56,7 +56,7 @@ async function updateUserChecked(
     throw error;
   }
   if (!data.user) {
-    throw new Error(`${operation} did not return a user.`);
+    throw new Error(`${operation} did not return a user.`, { cause: data });
   }
   return data.user;
 }
@@ -80,7 +80,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
       .catch((error: unknown) => {
         if (!mounted) return;
-        setInitializationError(error instanceof Error ? error : new Error("Session lookup failed"));
+        setInitializationError(
+          error instanceof Error ? error : new Error("Session lookup failed", { cause: error })
+        );
         setLoading(false);
       });
 
@@ -106,7 +108,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw error;
     }
     if (!data.session) {
-      throw new Error("Sign-in did not return a session.");
+      throw new Error("Sign-in did not return a session.", { cause: data });
     }
   }, []);
 
@@ -133,7 +135,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw error;
     }
     if (!data.url) {
-      throw new Error("Provider sign-in did not return a redirect URL.");
+      throw new Error("Provider sign-in did not return a redirect URL.", { cause: data });
     }
   }, []);
 
@@ -171,7 +173,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw reauthError;
       }
       if (!data.session) {
-        throw new Error("Reauthentication did not return a session");
+        throw new Error("Reauthentication did not return a session", { cause: data });
       }
       await updateUserChecked({ password: nextPassword }, undefined, "Password update");
       return data.session.access_token;
@@ -183,7 +185,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const trimmed = name.trim();
     const user = await updateUserChecked({ data: { name: trimmed } }, undefined, "Name update");
     if (user.user_metadata?.name !== trimmed) {
-      throw new Error("Profile update did not return the saved name.");
+      throw new Error("Profile update did not return the saved name.", { cause: user });
     }
   }, []);
 

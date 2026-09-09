@@ -7,6 +7,8 @@ import {
   drainBeforeClose,
   configurePageCapture,
   MOCK_RESPONSE_CAPTURE_HOOK,
+  missingMockResponses,
+  missingCdpStreamResponses,
   safeBody,
   safeError,
   safeText,
@@ -46,6 +48,7 @@ export const test = base.extend<DiagnosticFixtures>({
             kind: "diagnostic-collection",
             operation: "MSW mocked response",
             ...context,
+            payload: data,
             error: safeError(data.error),
           });
           return;
@@ -63,6 +66,7 @@ export const test = base.extend<DiagnosticFixtures>({
             operation: "MSW mocked response",
             ...context,
             error: safeError(new Error("MSW mocked response capture payload omitted response metadata or body.")),
+            payload: data,
           });
           return;
         }
@@ -81,8 +85,12 @@ export const test = base.extend<DiagnosticFixtures>({
         });
       };
       let testFailure: unknown;
+      let cdpStreams: Awaited<ReturnType<typeof configurePageCapture>>["cdpStreams"] | undefined;
       try {
-        record("diagnostic-config", await configurePageCapture(page));
+        const configured = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir });
+        const { cdpStreams: streams, ...configuration } = configured;
+        cdpStreams = streams;
+        record("diagnostic-config", configuration);
       } catch (error) {
         const failure = {
           kind: "diagnostic-collection",
@@ -112,6 +120,8 @@ export const test = base.extend<DiagnosticFixtures>({
         addFailure,
         pending,
         binaryArtifactDir,
+        mockResponseBodiesOrigin: new URL(testInfo.project.metadata.mockApiBaseUrl).origin,
+        cdpStreams,
       });
       if (!testFailure) {
         try {
@@ -154,7 +164,25 @@ export const test = base.extend<DiagnosticFixtures>({
         });
         testFailure ??= error;
       }
+      try {
+        cdpStreams?.close();
+      } catch (error) {
+        addFailure({ kind: "diagnostic-collection", operation: "close CDP response streams", error: safeError(error) });
+        testFailure ??= error;
+      }
       const drainAfterClose = await drainPending(pending);
+      for (const missing of missingCdpStreamResponses(observations)) {
+        addFailure({ kind: "diagnostic-collection", operation: "verify complete CDP response capture", ...missing,
+          error: safeError(new Error("Browser response has no complete captured CDP stream.")) });
+      }
+      for (const missing of missingMockResponses(observations)) {
+        addFailure({
+          kind: "diagnostic-collection",
+          operation: "verify complete MSW response capture",
+          ...missing,
+          error: safeError(new Error("Mocked browser responses and captured original bodies do not match.")),
+        });
+      }
       const drain = [...beforeClose, ...drainAfterClose];
       const rejected = drain.filter((result) => result.status === "rejected");
       if (rejected.length) {

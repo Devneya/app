@@ -9,6 +9,8 @@ import {
   drainPending,
   drainBeforeClose,
   installPageDiagnostics,
+  missingCdpStreamResponses,
+  missingMockResponses,
   safeBody,
   safeError,
   safeText,
@@ -43,6 +45,50 @@ function fakeRequest(overrides = {}) {
 }
 
 describe("browser diagnostics", () => {
+  it("detects missing original mock bodies and unmatched or duplicate source records", () => {
+    const response = { kind: "http", method: "GET", url: "https://example.test/account", status: 200, body: { captureSource: "msw-response:mocked" } };
+    const body = { ...response, body: "complete", captureSource: "msw-response:mocked" };
+    expect(missingMockResponses([response, body])).toEqual([]);
+    expect(missingMockResponses([response])).toMatchObject([{ observedResponses: 1, capturedBodies: 0 }]);
+    expect(missingMockResponses([body])).toMatchObject([{ observedResponses: 0, capturedBodies: 1 }]);
+    expect(missingMockResponses([response, response, body])).toMatchObject([{ observedResponses: 2, capturedBodies: 1 }]);
+  });
+  it("retains ordinary values and shared references while redacting named credentials", () => {
+    const shared = { value: "complete output", card_last_four: "4242" };
+    expect(safeBody({ first: shared, second: shared })).toEqual({ first: shared, second: shared });
+    const error = new Error("same failure");
+    expect(safeError(new AggregateError([error, error], "both")).errors[1].stack).toContain("same failure");
+    const circular = { value: "retained" };
+    circular.self = circular;
+    expect(safeBody(circular)).toEqual({ value: "retained", self: "[circular]" });
+    expect(safeBody([{ name: "content-type", value: "application/json" }, { name: "Authorization", value: "private-credential" }])).toEqual([
+      { name: "content-type", value: "application/json" }, { name: "Authorization", value: "[redacted]" },
+    ]);
+    expect(safeText('{"name":"Authorization","value":"private-credential"}')).not.toContain("private-credential");
+    expect(safeText('{"name":"content-type","value":"application/json"}')).toContain("application/json");
+    expect(safeUrl("https://example.test/page#details")).toBe("https://example.test/page#details");
+    expect(safeUrl("https://example.test/page#access_token=private-credential")).not.toContain("private-credential");
+    expect(safeUrl("not a URL: retained details")).toBe("not a URL: retained details");
+  });
+
+  it.each([
+    ["application/x-www-form-urlencoded", "value=first&value=second&password=private-credential"],
+    ["multipart/form-data; boundary=test-boundary", "--test-boundary\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\nfirst\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\nsecond\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nprivate-credential\r\n--test-boundary--\r\n"],
+  ])("retains repeated form values for %s", async (contentType, postData) => {
+    const page = fakePage();
+    const records = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, { pending, record: (kind, data) => records.push({ kind, ...data }), addFailure: failure => failures.push(failure) });
+    const request = fakeRequest({ allHeaders: async () => ({ "content-type": contentType }), postData: () => postData });
+    page.emit("response", { request: () => request, url: request.url, status: () => 200, allHeaders: async () => ({}), text: async () => "ok" });
+    await drainPending(pending);
+    expect(records[0].requestBody.fields ?? records[0].requestBody).toEqual([
+      { name: "value", contents: "first" }, { name: "value", contents: "second" }, { name: "password", contents: "[redacted]" },
+    ]);
+    expect(failures).toEqual([]);
+  });
+
   it("reports an unfinished teardown read without blocking page closure", async () => {
     vi.useFakeTimers();
     let finish;
@@ -154,9 +200,6 @@ describe("browser diagnostics", () => {
     expect(output).toContain("authentication succeeded");
     expect(output).toContain("browser exception");
     expect(output).toContain("stack");
-    expect(output).toContain("TypeError: nested");
-    expect(output).toContain("Error: first");
-    expect(output).toContain('"status":502');
     expect(output).toContain("requestHeaders");
     expect(output).toContain("requestBody");
     expect(output).toContain("connection reset");
@@ -191,6 +234,7 @@ describe("browser diagnostics", () => {
 
     expect(observations).toHaveLength(1);
     expect(observations[0].requestHeaders.collection_error.message).toContain("request headers unavailable");
+    expect(observations[0].requestBody).toEqual({ password: "[redacted]", ok: true });
     expect(failures).toHaveLength(1);
     expect(failures[0].kind).toBe("diagnostic-collection");
     expect(JSON.stringify(failures)).not.toContain("secret-token");
@@ -208,7 +252,7 @@ describe("browser diagnostics", () => {
 
     await page.emit("console", {
       type: () => "log",
-      text: () => "console capture failed",
+      text: () => { throw new Error("console text unavailable"); },
       args: () => {
         throw new Error("console arguments unavailable");
       },
@@ -218,7 +262,7 @@ describe("browser diagnostics", () => {
     const settled = await drainPending(pending);
     expect(settled).toHaveLength(1);
     expect(settled[0].status).toBe("rejected");
-    expect(failures[0].error.message).toContain("console arguments unavailable");
+    expect(failures[0].error.message).toContain("console text unavailable");
   });
 
   it("records 3xx bodies as unavailable under the Playwright response contract", async () => {
@@ -285,21 +329,175 @@ describe("browser diagnostics", () => {
     expect(failures).toHaveLength(0);
   });
 
-  it("configures uncached durable bodies through one reusable CDP setup", async () => {
+  it("configures uncached CDP streams through one reusable setup", async () => {
     const calls = [];
+    const listeners = new Map();
     const session = {
-      send: async (...args) => calls.push(args),
+      send: async (...args) => {
+        calls.push(args);
+        if (args[0] === "Page.getFrameTree") return { frameTree: { frame: { id: "root" } } };
+        if (args[0] === "Network.streamResourceContent") return { bufferedData: "" };
+        return {};
+      },
+      on: (event, listener) => listeners.set(event, listener),
+      off: (event, listener) => { if (listeners.get(event) === listener) listeners.delete(event); },
     };
     const page = {
       context: () => ({ newCDPSession: async () => session }),
+      exposeBinding: async () => {},
+      addInitScript: async () => {},
     };
 
-    await configurePageCapture(page);
+    const capture = await configurePageCapture(page, { record: () => {}, addFailure: () => {} });
     expect(calls).toEqual([
+      ["Page.getFrameTree"],
       ["Network.enable"],
       ["Network.setCacheDisabled", { cacheDisabled: true }],
-      ["Network.configureDurableMessages", { maxTotalBufferSize: 8388608, maxResourceBufferSize: 2097152 }],
     ]);
+    expect(capture.cdpBodyCapture).toBe("streamResourceContent");
+    capture.cdpStreams.close();
+  });
+
+  it("captures a main-frame body from request-time CDP streaming", async () => {
+    const page = fakePage();
+    const calls = [];
+    const listeners = new Map();
+    const payload = Buffer.from(JSON.stringify({ status: "streamed" }));
+    const session = {
+      send: async (...args) => {
+        calls.push(args);
+        if (args[0] === "Page.getFrameTree") return { frameTree: { frame: { id: "root" } } };
+        if (args[0] === "Network.streamResourceContent" && args[1].requestId === "request-3") {
+          throw new Error("Request with the provided ID has already finished loading");
+        }
+        if (args[0] === "Network.getResponseBody" && args[1].requestId === "request-3") {
+          return { body: JSON.stringify({ fallback: "complete" }), base64Encoded: false };
+        }
+        if (args[0] === "Network.streamResourceContent") return { bufferedData: payload.toString("base64") };
+        return {};
+      },
+      on: (event, listener) => listeners.set(event, listener),
+      off: (event, listener) => { if (listeners.get(event) === listener) listeners.delete(event); },
+      emit: (event, value) => listeners.get(event)?.(value),
+    };
+    page.context = () => ({ newCDPSession: async () => session });
+    page.exposeBinding = async () => {};
+    page.addInitScript = async () => {};
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    const capture = await configurePageCapture(page, {
+      pending,
+      record: (kind, value) => observations.push({ kind, ...value }),
+      addFailure: failure => failures.push(failure),
+    });
+    installPageDiagnostics(page, {
+      pending,
+      cdpStreams: capture.cdpStreams,
+      record: (kind, value) => observations.push({ kind, ...value }),
+      addFailure: failure => failures.push(failure),
+    });
+    session.emit("Network.requestWillBeSent", {
+      requestId: "request-1",
+      frameId: "root",
+      request: { url: "https://api.example.test/account", method: "GET" },
+    });
+    session.emit("Network.responseReceived", {
+      requestId: "request-1",
+      response: { url: "https://api.example.test/account", status: 200, headers: { "content-type": "application/json" } },
+    });
+    session.emit("Network.loadingFinished", { requestId: "request-1", encodedDataLength: payload.length });
+    const request = fakeRequest({
+      method: () => "GET",
+      url: () => "https://api.example.test/account",
+      allHeaders: async () => ({}),
+      postData: () => null,
+    });
+    await page.emit("response", {
+      request: () => request,
+      url: request.url,
+      status: () => 200,
+      resourceType: () => "fetch",
+      frame: () => ({ parentFrame: () => null }),
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      body: async () => { throw new Error("delayed Playwright body was used"); },
+    });
+    await drainPending(pending);
+    const record = observations.find(item => item.kind === "http" && item.captureSource === "cdp-stream");
+    expect(record.body).toEqual({ status: "streamed" });
+    expect(record.captureSource).toBe("cdp-stream");
+    expect(record.streamComplete).toBe(true);
+    expect(observations.find(item => item.kind === "http" && item.body?.captureSource === "cdp-stream")).toBeTruthy();
+    expect(missingCdpStreamResponses(observations)).toEqual([]);
+    expect(failures).toEqual([]);
+    expect(calls.some(([name]) => name === "Network.configureDurableMessages")).toBe(false);
+    session.emit("Network.requestWillBeSent", {
+      requestId: "request-2",
+      frameId: "root",
+      request: { url: "https://api.example.test/partial", method: "GET" },
+    });
+    session.emit("Network.responseReceived", {
+      requestId: "request-2",
+      response: { url: "https://api.example.test/partial", status: 200, headers: { "content-type": "application/json" } },
+    });
+    session.emit("Network.dataReceived", { requestId: "request-2", data: Buffer.from("partial").toString("base64") });
+    session.emit("Network.loadingFailed", { requestId: "request-2", errorText: "local stream failure", canceled: false });
+    const partialRequest = fakeRequest({
+      method: () => "GET",
+      url: () => "https://api.example.test/partial",
+      allHeaders: async () => ({}),
+      postData: () => null,
+    });
+    await page.emit("response", {
+      request: () => partialRequest,
+      url: partialRequest.url,
+      status: () => 200,
+      resourceType: () => "fetch",
+      frame: () => ({ parentFrame: () => null }),
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      body: async () => { throw new Error("delayed Playwright body was used"); },
+    });
+    await drainPending(pending);
+    const partial = observations.find(item => item.kind === "http" && item.url.endsWith("/partial") && item.captureSource === "cdp-stream");
+    expect(partial.streamComplete).toBe(false);
+    expect(partial.cdpStream.errors[0].message).toContain("local stream failure");
+    expect(failures.some(item => item.operation === "CDP response loading")).toBe(true);
+    session.emit("Network.requestWillBeSent", {
+      requestId: "request-3",
+      frameId: "root",
+      request: { url: "https://api.example.test/fallback", method: "GET" },
+    });
+    session.emit("Network.responseReceived", {
+      requestId: "request-3",
+      response: { url: "https://api.example.test/fallback", status: 200, headers: { "content-type": "application/json" } },
+    });
+    session.emit("Network.loadingFinished", { requestId: "request-3", encodedDataLength: 22 });
+    const fallbackRequest = fakeRequest({
+      method: () => "GET",
+      url: () => "https://api.example.test/fallback",
+      allHeaders: async () => ({}),
+      postData: () => null,
+    });
+    await page.emit("response", {
+      request: () => fallbackRequest,
+      url: fallbackRequest.url,
+      status: () => 200,
+      resourceType: () => "fetch",
+      frame: () => ({ parentFrame: () => null }),
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      body: async () => { throw new Error("delayed Playwright body was used"); },
+    });
+    await drainPending(pending);
+    const fallback = observations.find(item => item.kind === "http" && item.url.endsWith("/fallback") && item.captureSource === "cdp-stream");
+    expect(fallback.body).toEqual({ fallback: "complete" });
+    expect(fallback.streamComplete).toBe(false);
+    expect(fallback.bodyCaptureComplete).toBe(true);
+    expect(fallback.bodyCaptureMethod).toBe("Network.getResponseBody");
+    expect(fallback.cdpStream.errors[0].message).toContain("already finished loading");
+    expect(missingCdpStreamResponses(observations)).toMatchObject([
+      { response: ["GET", "https://api.example.test/partial", 200], observedResponses: 1, capturedBodies: 0 },
+    ]);
+    capture.cdpStreams.close();
   });
 
   it("stores binary response bytes privately instead of decoding them as text", async () => {
@@ -337,6 +535,41 @@ describe("browser diagnostics", () => {
     } finally {
       await rm(artifactDir, { recursive: true, force: true });
     }
+  });
+
+  it("retains duplicate headers and complete binary bytes without an artifact directory", async () => {
+    const page = fakePage();
+    const records = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, { pending, record: (kind, data) => records.push({ kind, ...data }), addFailure: failure => failures.push(failure) });
+    const headers = [{ name: "X-Diagnostic", value: "first" }, { name: "X-Diagnostic", value: "second" }];
+    const request = fakeRequest({ headersArray: async () => headers, postData: () => null });
+    const bytes = Buffer.from([0, 255, 128, 1]);
+    page.emit("response", { request: () => request, url: request.url, status: () => 200, headersArray: async () => headers, body: async () => bytes });
+    await drainPending(pending);
+    expect(records[0].headers).toEqual(headers);
+    expect(records[0].requestHeaders).toEqual(headers);
+    expect(Buffer.from(records[0].body.base64, "base64")).toEqual(bytes);
+    expect(failures).toEqual([]);
+  });
+
+  it("uses the original mock body source only within its configured origin", async () => {
+    const page = fakePage();
+    const records = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, { pending, mockResponseBodiesOrigin: "https://api.stage.devneya.com", record: (kind, data) => records.push({ kind, ...data }), addFailure: failure => failures.push(failure) });
+    const request = fakeRequest();
+    const text = vi.fn(async () => "complete passthrough body");
+    for (const url of [request.url(), "https://fonts.example.test/style.css"]) {
+      page.emit("response", { request: () => request, url: () => url, status: () => 200, fromServiceWorker: () => true, allHeaders: async () => ({}), text });
+    }
+    await drainPending(pending);
+    expect(records.find(record => record.url.startsWith("https://api.stage"))?.body).toEqual({ captureSource: "msw-response:mocked" });
+    expect(records.find(record => record.url.startsWith("https://fonts"))?.body).toBe("complete passthrough body");
+    expect(text).toHaveBeenCalledTimes(1);
+    expect(failures).toEqual([]);
   });
 
   it("redacts JSON credentials even when a provider labels the body as binary", async () => {

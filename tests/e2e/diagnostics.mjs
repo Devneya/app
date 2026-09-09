@@ -1,11 +1,12 @@
-/* global Buffer, Headers, TextDecoder, URL, URLSearchParams */
+/* global Buffer, Headers, Response, TextDecoder, URL, URLSearchParams */
 
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { installConsoleCapture } from "./console-capture.mjs";
 
 const SENSITIVE_KEY =
-  /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|value|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|x-(?:amz|goog)-[\w-]+|card|cvv|cvc|email)(?:$|[_-])/i;
+  /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|x-(?:amz|goog)-[\w-]+|card[_-]?number|cvv|cvc|email)(?:$|[_-])/i;
 
 function isObject(value) {
   return typeof value === "object" && value !== null;
@@ -64,20 +65,32 @@ export function safeUrl(value) {
   try {
     const url = new URL(String(value));
     if (url.protocol === "blob:") return `blob:${safeUrl(url.pathname + url.search)}`;
+    if (url.protocol !== "https:" && url.protocol !== "http:") return safeText(value, false);
     const query = safeUrlQuery(url);
+    const hash = url.hash ? `#${safeText(url.hash.slice(1), false)}` : "";
     if (/(^|\.)checkout\.dodopayments\.com$/.test(url.hostname) && /^\/[^/.]+\/?$/.test(url.pathname)) {
-      return `${url.origin}/[redacted-capability]${query ? `?${query}` : ""}`;
+      return `${url.origin}/[redacted-capability]${query ? `?${query}` : ""}${hash}`;
     }
-    return `${url.origin}${safeUrlPath(url.pathname)}${query ? `?${query}` : ""}`;
+    return `${url.origin}${safeUrlPath(url.pathname)}${query ? `?${query}` : ""}${hash}`;
   } catch {
-    return "[invalid-url]";
+    return safeText(value, false);
   }
 }
 
-export function safeText(value) {
+export function safeText(value, scrubUrls = true) {
   return String(value)
+    .replace(/\{[^{}]*\}/g, (fragment) => {
+      try {
+        const descriptor = JSON.parse(fragment);
+        if (typeof descriptor.name === "string" && SENSITIVE_KEY.test(descriptor.name) && "value" in descriptor) {
+          return JSON.stringify({ ...descriptor, value: "[redacted]" });
+        }
+      } catch { /* Not a JSON descriptor; the text rules below still apply. */ }
+      return fragment;
+    })
     .replace(/\b(?:cks|cs)_[A-Za-z0-9_-]+/g, "[redacted-capability]")
-    .replace(/https?:\/\/[^\s\\"<>]+/g, (url) => safeUrl(url))
+    .replace(/(https?:\/\/)[^/@\s]+@/g, "$1[redacted]@")
+    .replace(/https?:\/\/[^\s\\"<>]+/g, (url) => scrubUrls ? safeUrl(url) : url)
     .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [redacted]")
     .replace(/\bBasic\s+[^\s"']+/gi, "Basic [redacted]")
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted-token]")
@@ -92,7 +105,7 @@ export function safeText(value) {
       "$1[redacted]"
     )
     .replace(
-      /(["'](?:password|[\w-]*secret|authorization|cookie|access_token|refresh_token|id_token|token|key|value|email|checkout_url|portal_url)["']\s*:\s*)["'][^"']*["']/gi,
+      /(["'](?:password|[\w-]*secret|authorization|cookie|access_token|refresh_token|id_token|token|key|email|checkout_url|portal_url)["']\s*:\s*)["'][^"']*["']/gi,
       '$1"[redacted]"'
     )
     .replace(
@@ -109,6 +122,7 @@ export function safeError(error, seen = new WeakSet()) {
   if (error instanceof Error) {
     if (seen.has(error)) return { message: "[circular-error]" };
     seen.add(error);
+    try {
     const output = {
       name: safeText(error.name || "Error"),
       message: safeText(error.message || String(error)),
@@ -127,6 +141,9 @@ export function safeError(error, seen = new WeakSet()) {
       output[key] = SENSITIVE_KEY.test(key) ? "[redacted]" : safeBody(value, seen);
     }
     return output;
+    } finally {
+      seen.delete(error);
+    }
   }
   if (isObject(error)) {
     return { name: "Error", message: safeText(error.message ?? String(error)), details: safeBody(error, seen) };
@@ -143,47 +160,73 @@ export function safeBody(value, seen = new WeakSet()) {
   if (value instanceof Headers) return safeHeaders(value, seen);
   if (seen.has(value)) return "[circular]";
   seen.add(value);
+  try {
   if (Array.isArray(value)) return value.map((item) => safeBody(item, seen));
   const output = {};
   for (const [key, item] of Object.entries(value)) {
-    const numericValue = key.toLowerCase() === "value" && typeof item === "number";
-    output[key] = (SENSITIVE_KEY.test(key) || /token$/i.test(key)) && !numericValue
+    const credentialValue = key.toLowerCase() === "value" &&
+      typeof value.name === "string" && SENSITIVE_KEY.test(value.name);
+    output[key] = SENSITIVE_KEY.test(key) || /token$/i.test(key) || credentialValue
       ? "[redacted]"
       : safeBody(item, seen);
   }
   return output;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 export function safeHeaders(value, seen = new WeakSet()) {
   if (value && typeof value.entries === "function") {
+    if (Array.isArray(value)) return safeBody(value, seen);
     return safeBody(Object.fromEntries(value.entries()), seen);
   }
   return safeBody(value, seen);
 }
 
-function requestBody(request, requestHeaders) {
+function contentTypeOf(headers) {
+  if (Array.isArray(headers)) return headers.find(header => header.name.toLowerCase() === "content-type")?.value ?? "";
+  return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "content-type")?.[1] ?? "";
+}
+
+function readHeaders(message) {
+  return typeof message.headersArray === "function" ? message.headersArray() : message.allHeaders();
+}
+
+async function requestBody(request, requestHeaders) {
   const postData = request.postData();
   if (postData === null) return undefined;
-  if (requestHeaders?.collection_error) {
-    return { body_unavailable: "request headers could not be collected" };
-  }
-  const contentType = Object.entries(requestHeaders ?? {}).find(
-    ([key]) => key.toLowerCase() === "content-type"
-  )?.[1] ?? "";
+  const contentType = contentTypeOf(requestHeaders);
   if (
     contentType.toLowerCase().includes("multipart/form-data") ||
     /content-disposition:\s*form-data/i.test(postData)
   ) {
-    const fieldNames = [...postData.matchAll(/name="([^"]+)"/g)].map((match) => match[1]);
-    return {
-      multipart: true,
-      fieldNames: fieldNames.map((name) => safeText(name)),
-      sensitiveBodyExcluded: true,
-      exclusionReason: "multipart values may contain credentials or payment data",
-    };
+    const type = contentType || `multipart/form-data; boundary=${postData.split("\r\n", 1)[0].slice(2)}`;
+    const raw = typeof request.postDataBuffer === "function" ? request.postDataBuffer() : postData;
+    const form = await new Response(raw, { headers: { "content-type": type } }).formData();
+    const fields = [];
+    for (const [name, value] of form) {
+      if (typeof value === "string") {
+        fields.push({ name, contents: safeBody({ [name]: value })[name] });
+      } else {
+        const bytes = Buffer.from(await value.arrayBuffer());
+        let contents;
+        try {
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          try { contents = safeBody(JSON.parse(text)); } catch { contents = safeText(text); }
+        } catch {
+          contents = { base64: bytes.toString("base64"), byteLength: bytes.byteLength };
+        }
+        fields.push({ name, filename: safeText(value.name), contentType: value.type,
+          contents: SENSITIVE_KEY.test(name) ? "[redacted]" : contents });
+      }
+    }
+    return { multipart: true, fields };
   }
   if (contentType.toLowerCase().includes("application/x-www-form-urlencoded")) {
-    return safeBody(Object.fromEntries(new URLSearchParams(postData).entries()));
+    return [...new URLSearchParams(postData)].map(([name, value]) => ({
+      name, contents: safeBody({ [name]: value })[name],
+    }));
   }
   try {
     return safeBody(JSON.parse(postData));
@@ -239,13 +282,309 @@ export async function drainPending(pending) {
   return settled;
 }
 
-export async function configurePageCapture(page) {
+function responseIsMainFrame(response, addFailure) {
+  if (typeof response.frame !== "function") return undefined;
+  try {
+    const frame = response.frame();
+    return typeof frame?.parentFrame === "function" ? frame.parentFrame() === null : undefined;
+  } catch (error) {
+    addFailure({
+      kind: "diagnostic-collection",
+      operation: "response frame metadata",
+      error: safeError(error),
+    });
+    return undefined;
+  }
+}
+
+function createCdpStreamCapture(session, rootFrameId, { pending, record, addFailure, binaryArtifactDir }) {
+  const entries = new Map();
+  const listeners = new Map();
+  let binarySequence = 0;
+
+  const listen = (event, listener) => {
+    session.on(event, listener);
+    listeners.set(event, listener);
+  };
+
+  const retainEntryError = (entry, error) => {
+    entry.errors.push(error);
+  };
+
+  const addEntryFailure = (entry, error, operation = "CDP response stream") => {
+    retainEntryError(entry, error);
+    addFailure({
+      kind: "diagnostic-collection",
+      operation,
+      url: safeUrl(entry.response?.url ?? entry.url),
+      method: entry.method,
+      ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
+      error: safeError(error),
+    });
+  };
+
+  const finish = (entry, status) => {
+    if (entry.settled) return;
+    entry.settled = true;
+    entry.finished = status === "finished";
+    entry.loadingFailed = status === "failed";
+    entry.resolveDone();
+  };
+
+  const emitEntry = async entry => {
+    await entry.streamTask;
+    const bytes = entry.fallbackBody ?? Buffer.concat([entry.buffered, ...entry.chunks]);
+    const url = safeUrl(entry.response?.url ?? entry.url);
+    const context = {
+      url,
+      method: entry.method,
+      ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
+      ...(entry.response?.fromServiceWorker !== undefined
+        ? { fromServiceWorker: entry.response.fromServiceWorker }
+        : {}),
+    };
+    try {
+      const responseHeaders = entry.response?.headers ?? {};
+      const serialized = await serializeResponseBody(bytes, responseHeaders, context, {
+        binaryArtifactDir,
+        binaryPrefix: "cdp-response",
+        nextBinaryArtifact: () => ++binarySequence,
+        addFailure,
+      });
+      const request = {
+        postData: () => entry.postData ?? null,
+        postDataBuffer: () => entry.postData ?? null,
+      };
+      const requestData = await collect(
+        "request body",
+        () => requestBody(request, entry.requestHeaders ?? {}),
+        context,
+        addFailure,
+      );
+      const item = {
+        ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
+        method: entry.method,
+        resourceType: entry.resourceType ?? "unknown",
+        url,
+        requestHeaders: safeHeaders(entry.requestHeaders ?? {}),
+        headers: safeHeaders(responseHeaders),
+        requestBody: requestData,
+        body: entry.errors.length && bytes.byteLength === 0
+          ? { collection_error: entry.errors.map(error => safeError(error)), partialByteLength: 0 }
+          : serialized.body,
+        mainFrame: true,
+        ...(context.fromServiceWorker !== undefined
+          ? { fromServiceWorker: context.fromServiceWorker }
+          : {}),
+        captureSource: "cdp-stream",
+        streamComplete: entry.finished && !entry.loadingFailed && entry.streamMethodSucceeded === true,
+        bodyCaptureComplete: entry.bodyCaptureComplete === true && !entry.loadingFailed,
+        bodyCaptureMethod: entry.bodyCaptureMethod,
+        cdpStream: {
+          requestId: entry.requestId,
+          frameId: entry.frameId,
+          bufferedBytes: entry.buffered.byteLength,
+          chunkCount: entry.chunks.length,
+          byteLength: bytes.byteLength,
+          ...(entry.response?.mimeType ? { mimeType: entry.response.mimeType } : {}),
+          ...(entry.encodedDataLength !== undefined ? { encodedDataLength: entry.encodedDataLength } : {}),
+          ...(entry.errors.length ? { errors: entry.errors.map(error => safeError(error)) } : {}),
+        },
+      };
+      record("http", item);
+    } catch (error) {
+      addFailure({
+        kind: "diagnostic-collection",
+        operation: "CDP response record",
+        ...context,
+        error: safeError(error),
+      });
+    }
+  };
+
+  const createEntry = (event) => {
+    let resolveDone;
+    const entry = {
+      requestId: event.requestId,
+      frameId: event.frameId,
+      url: event.request?.url ?? "",
+      method: event.request?.method ?? "GET",
+      resourceType: event.type,
+      requestHeaders: event.request?.headers ?? {},
+      postData: event.request?.postData,
+      chunks: [],
+      buffered: Buffer.alloc(0),
+      errors: [],
+      settled: false,
+      finished: false,
+      loadingFailed: false,
+      done: new Promise(resolve => { resolveDone = resolve; }),
+      resolveDone,
+    };
+    entries.set(entry.requestId, entry);
+    let streamCommand;
+    try {
+      streamCommand = session.send("Network.streamResourceContent", { requestId: entry.requestId });
+    } catch (error) {
+      streamCommand = Promise.reject(error);
+    }
+    entry.streamTask = Promise.resolve(streamCommand)
+      .then(result => {
+        if (typeof result?.bufferedData !== "string") {
+          const error = new Error("Network.streamResourceContent returned no bufferedData string");
+          error.cause = safeBody(result);
+          throw error;
+        }
+        entry.buffered = Buffer.from(result.bufferedData, "base64");
+        entry.streamMethodSucceeded = true;
+        entry.bodyCaptureComplete = true;
+        entry.bodyCaptureMethod = "Network.streamResourceContent";
+      })
+      .catch(async error => {
+        const alreadyFinished = /Request with the provided ID has already finished loading/i.test(error?.message ?? "");
+        if (!alreadyFinished) {
+          addEntryFailure(entry, error);
+          return;
+        }
+        retainEntryError(entry, error);
+        try {
+          const result = await session.send("Network.getResponseBody", { requestId: entry.requestId });
+          if (typeof result?.body !== "string" || typeof result?.base64Encoded !== "boolean") {
+            const keys = result && typeof result === "object" ? Object.keys(result).join(", ") : typeof result;
+            const error = new Error(`Network.getResponseBody returned no complete body result (keys: ${keys})`);
+            error.cause = safeBody(result);
+            throw error;
+          }
+          entry.fallbackBody = Buffer.from(result.body, result.base64Encoded ? "base64" : "utf8");
+          entry.bodyCaptureComplete = true;
+          entry.bodyCaptureMethod = "Network.getResponseBody";
+          record("capture-method", {
+            operation: "CDP response stream",
+            fallback: "Network.getResponseBody",
+            requestId: entry.requestId,
+            url: safeUrl(entry.url),
+            method: entry.method,
+            error: safeError(error),
+          });
+        } catch (fallbackError) {
+          addFailure({
+            kind: "diagnostic-collection",
+            operation: "CDP response stream",
+            url: safeUrl(entry.response?.url ?? entry.url),
+            method: entry.method,
+            ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
+            error: safeError(error),
+          });
+          addEntryFailure(entry, fallbackError, "CDP completed-body fallback");
+        }
+      });
+    entry.emitTask = Promise.all([entry.streamTask, entry.done]).then(() => emitEntry(entry));
+    track(pending, "CDP response stream", entry.emitTask, { url: safeUrl(entry.url), method: entry.method }, addFailure);
+    return entry;
+  };
+
+  listen("Network.requestWillBeSent", event => {
+    if (event.frameId !== rootFrameId) return;
+    const previous = entries.get(event.requestId);
+    if (previous && !previous.settled) {
+      if (event.redirectResponse) {
+        previous.response = {
+          url: event.redirectResponse.url ?? previous.url,
+          status: event.redirectResponse.status,
+          headers: event.redirectResponse.headers ?? {},
+          mimeType: event.redirectResponse.mimeType,
+          fromServiceWorker: event.redirectResponse.fromServiceWorker,
+        };
+        const error = new Error("CDP stream ended at a redirect before its final response body was available");
+        addEntryFailure(previous, error, "CDP redirect response stream");
+        finish(previous, "failed");
+      } else {
+        addEntryFailure(previous, new Error("CDP request identifier was reused before its stream finished"));
+        finish(previous, "failed");
+      }
+    }
+    createEntry(event);
+  });
+  listen("Network.responseReceived", event => {
+    const entry = entries.get(event.requestId);
+    if (!entry || entry.settled) return;
+    entry.response = {
+      url: event.response?.url ?? entry.url,
+      status: event.response?.status,
+      headers: event.response?.headers ?? {},
+      mimeType: event.response?.mimeType,
+      fromServiceWorker: event.response?.fromServiceWorker,
+    };
+    entry.resourceType = event.type ?? entry.resourceType;
+  });
+  listen("Network.dataReceived", event => {
+    const entry = entries.get(event.requestId);
+    if (!entry || entry.settled) return;
+    if (typeof event.data === "string") entry.chunks.push(Buffer.from(event.data, "base64"));
+  });
+  listen("Network.loadingFinished", event => {
+    const entry = entries.get(event.requestId);
+    if (!entry || entry.settled) return;
+    entry.encodedDataLength = event.encodedDataLength;
+    finish(entry, "finished");
+  });
+  listen("Network.loadingFailed", event => {
+    const entry = entries.get(event.requestId);
+    if (!entry || entry.settled) return;
+    const error = new Error(event.errorText || "Network loading failed");
+    if (event.canceled !== undefined) error.canceled = event.canceled;
+    entry.loadingError = error;
+    addEntryFailure(entry, error, "CDP response loading");
+    finish(entry, "failed");
+  });
+
+  const close = () => {
+    for (const [event, listener] of listeners) {
+      if (typeof session.off === "function") session.off(event, listener);
+      else session.removeListener(event, listener);
+    }
+    for (const entry of entries.values()) {
+      if (!entry.settled) {
+        addEntryFailure(entry, new Error("CDP response stream stopped before loading finished"), "CDP response stream teardown");
+        finish(entry, "failed");
+      }
+    }
+  };
+
+  return { close, entries };
+}
+
+export async function configurePageCapture(
+  page,
+  { record, addFailure, pending = [], binaryArtifactDir } = {},
+) {
+  await installConsoleCapture(page, payload => {
+    const safe = safeBody(payload);
+    record("console-call", safe);
+    if (payload.kind !== "console-call") {
+      addFailure({ kind: "diagnostic-collection", operation: "console source snapshot", ...safe });
+    }
+  });
   const session = await page.context().newCDPSession(page);
-  const buffers = { maxTotalBufferSize: 8 * 1024 * 1024, maxResourceBufferSize: 2 * 1024 * 1024 };
+  const frameTree = await session.send("Page.getFrameTree");
+  const rootFrameId = frameTree.frameTree.frame.id;
   await session.send("Network.enable");
   await session.send("Network.setCacheDisabled", { cacheDisabled: true });
-  await session.send("Network.configureDurableMessages", buffers);
-  return { browserCache: "disabled", cacheCoverage: "not-covered", durableResponseBodies: buffers };
+  const cdpStreams = createCdpStreamCapture(session, rootFrameId, {
+    pending,
+    record,
+    addFailure,
+    binaryArtifactDir,
+  });
+
+  return {
+    browserCache: "disabled",
+    cacheCoverage: "not-covered",
+    cdpBodyCapture: "streamResourceContent",
+    cdpBodyCoverage: "main-frame-only",
+    rootFrameId,
+    cdpStreams,
+  };
 }
 
 export async function drainBeforeClose(pending) {
@@ -267,39 +606,45 @@ export async function drainBeforeClose(pending) {
 
 export const MOCK_RESPONSE_CAPTURE_HOOK = "__devneyaCaptureMockResponse";
 
-async function captureResponse(response, options) {
-  const request = response.request();
-  const url = safeUrl(response.url());
-  const context = {
-    url,
-    method: request.method(),
-    status: response.status(),
-    ...(typeof response.fromServiceWorker === "function"
-      ? { fromServiceWorker: response.fromServiceWorker() }
-      : {}),
-  };
-  const responseHeadersTask = collect(
-    "response headers",
-    () => response.allHeaders(),
-    context,
-    options.addFailure
-  );
-  const redirectResponse = context.status >= 300 && context.status <= 399;
-  const responseBodyTask = redirectResponse
-    ? Promise.resolve({
-        unavailable: true,
-        reason: "Playwright does not expose response bodies for 3xx responses",
-      })
-    : collect(
-        "response body",
-        () => (typeof response.body === "function" ? response.body() : response.text()),
-        context,
-        options.addFailure
-      );
-  const [responseHeaders, responseBody] = await Promise.all([responseHeadersTask, responseBodyTask]);
-  const contentType = Object.entries(responseHeaders ?? {}).find(
-    ([key]) => key.toLowerCase() === "content-type"
-  )?.[1] ?? "";
+export function missingMockResponses(observations) {
+  const counts = new Map();
+  for (const item of observations) {
+    if (item.kind !== "http") continue;
+    const source = item.captureSource === "msw-response:mocked";
+    if (!source && item.body?.captureSource !== "msw-response:mocked") continue;
+    const key = JSON.stringify([item.method, item.url, item.status]);
+    const count = counts.get(key) ?? { response: [item.method, item.url, item.status], observedResponses: 0, capturedBodies: 0 };
+    count[source ? "capturedBodies" : "observedResponses"] += 1;
+    counts.set(key, count);
+  }
+  return [...counts.values()].filter(count => count.observedResponses !== count.capturedBodies);
+}
+
+export function missingCdpStreamResponses(observations) {
+  const counts = new Map();
+  for (const item of observations) {
+    if (item.kind !== "http" || item.mainFrame !== true) continue;
+    if (item.status >= 300 && item.status <= 399) continue;
+    const source = item.captureSource === "cdp-stream";
+    const placeholder = item.body?.captureSource === "cdp-stream";
+    if (!source && !placeholder) continue;
+    const key = JSON.stringify([item.method, item.url, item.status]);
+    const count = counts.get(key) ?? {
+      response: [item.method, item.url, item.status],
+      observedResponses: 0,
+      capturedBodies: 0,
+    };
+    if (placeholder) count.observedResponses += 1;
+    if (source && item.bodyCaptureComplete === true) count.capturedBodies += 1;
+    counts.set(key, count);
+  }
+  return [...counts.values()]
+    .filter(count => count.observedResponses > 0)
+    .filter(count => count.observedResponses > count.capturedBodies);
+}
+
+async function serializeResponseBody(responseBody, responseHeaders, context, options) {
+  const contentType = contentTypeOf(responseHeaders);
   const isTextResponse =
     /(?:^|\/|\+)(?:json|javascript|xml|svg|css|html|x-www-form-urlencoded)(?:[;+]|$)/i.test(contentType) ||
     /^text\//i.test(contentType);
@@ -334,9 +679,9 @@ async function captureResponse(response, options) {
     if (options.binaryArtifactDir) {
       try {
         await mkdir(options.binaryArtifactDir, { recursive: true, mode: 0o700 });
-        const name = `response-${options.nextBinaryArtifact()}.bin`;
+        const name = `${options.binaryPrefix ?? "response"}-${options.nextBinaryArtifact()}.bin`;
         const path = join(options.binaryArtifactDir, name);
-        await writeFile(path, bytes, { mode: 0o600 });
+        await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
         artifact = path;
       } catch (error) {
         options.addFailure({
@@ -352,15 +697,54 @@ async function captureResponse(response, options) {
       byteLength: bytes.byteLength,
       sha256,
       ...(artifact ? { artifact } : {}),
+      ...(!artifact ? { base64: bytes.toString("base64") } : {}),
     };
     bodyCaptured = true;
   }
-  if (!bodyCaptured) {
-    body = responseBody;
-  }
+  return { body: bodyCaptured ? body : responseBody, bodyCaptured, bytes };
+}
+
+async function captureResponse(response, options) {
+  const request = response.request();
+  const url = safeUrl(response.url());
+  const mainFrame = responseIsMainFrame(response, options.addFailure);
+  const context = {
+    url,
+    method: request.method(),
+    status: response.status(),
+    ...(typeof response.fromServiceWorker === "function"
+      ? { fromServiceWorker: response.fromServiceWorker() }
+      : {}),
+  };
+  const responseHeadersTask = collect(
+    "response headers",
+    () => readHeaders(response),
+    context,
+    options.addFailure
+  );
+  const redirectResponse = context.status >= 300 && context.status <= 399;
+  const responseBodyTask = options.mockResponseBodiesOrigin && context.fromServiceWorker &&
+    new URL(response.url()).origin === options.mockResponseBodiesOrigin
+    ? Promise.resolve({ captureSource: "msw-response:mocked" })
+    : redirectResponse
+    ? Promise.resolve({
+        unavailable: true,
+        reason: "Playwright does not expose response bodies for 3xx responses",
+      })
+    : mainFrame === true && options.cdpStreams
+    ? Promise.resolve({ captureSource: "cdp-stream" })
+    : collect(
+        "response body",
+        () => (typeof response.body === "function" ? response.body() : response.text()),
+        context,
+        options.addFailure
+      );
+  const [responseHeaders, responseBody] = await Promise.all([responseHeadersTask, responseBodyTask]);
+  const serialized = await serializeResponseBody(responseBody, responseHeaders, context, options);
+  const body = serialized.body;
   const requestHeaders = await collect(
     "request headers",
-    () => request.allHeaders(),
+    () => readHeaders(request),
     context,
     options.addFailure
   );
@@ -379,6 +763,7 @@ async function captureResponse(response, options) {
     headers: safeHeaders(responseHeaders),
     requestBody: requestData,
     body,
+    ...(mainFrame !== undefined ? { mainFrame } : {}),
     ...(context.fromServiceWorker !== undefined
       ? { fromServiceWorker: context.fromServiceWorker }
       : {}),
@@ -387,92 +772,13 @@ async function captureResponse(response, options) {
   if (response.status() >= 400) options.addFailure({ kind: "http", ...item });
 }
 
-async function serializeBrowserError(handle) {
-  if (typeof handle.evaluate !== "function") return undefined;
-  return handle.evaluate((value) => {
-    if (!(value instanceof Error || Object.prototype.toString.call(value) === "[object Error]")) {
-      return undefined;
-    }
-    const seen = new Set();
-    const serializeValue = (item) => {
-      if (item === null || typeof item !== "object") return item;
-      if (item instanceof Error || Object.prototype.toString.call(item) === "[object Error]") return serialize(item);
-      if (seen.has(item)) return "[circular]";
-      seen.add(item);
-      if (Array.isArray(item)) return item.map(serializeValue);
-      const output = {};
-      for (const [key, entry] of Object.entries(item)) {
-        output[key] = serializeValue(entry);
-      }
-      return output;
-    };
-    const serialize = (error) => {
-      if (!error || typeof error !== "object") return { message: String(error) };
-      if (seen.has(error)) return { message: "[circular-error]" };
-      seen.add(error);
-      const output = {
-        name: String(error.name || "Error"),
-        message: String(error.message || error),
-        stack: String(error.stack || ""),
-      };
-      if ("cause" in error && error.cause !== undefined) output.cause = serialize(error.cause);
-      if (Array.isArray(error.errors)) output.errors = error.errors.map(serialize);
-      for (const [key, item] of Object.entries(error)) {
-        if (key === "cause" || key === "errors" || key in output) continue;
-        output[key] = serializeValue(item);
-      }
-      return output;
-    };
-    return { __devneyaError: serialize(value) };
-  });
-}
-
-async function captureConsoleArg(handle) {
-  const value = await handle.jsonValue();
-  if (value === null || typeof value !== "object") return safeBody(value);
-  const browserError = await serializeBrowserError(handle);
-  if (browserError?.__devneyaError) return safeBody(browserError.__devneyaError);
-  return safeBody(value);
-}
-
 async function captureConsole(message, options) {
-  const args = [];
-  const argErrors = [];
-  const results = await Promise.all(message.args().map(async (handle, index) => {
-    try {
-      return { value: await captureConsoleArg(handle) };
-    } catch (error) {
-      return { error, handle, index };
-    }
-  }));
-  for (const result of results) {
-    if ("value" in result) {
-      args.push(result.value);
-      continue;
-    }
-    const detail = {
-      index: result.index,
-      handle: safeText(result.handle),
-      error: safeError(result.error),
-      ...( /Execution context was destroyed/i.test(result.error?.message ?? "")
-        ? { expectedLifecycle: true }
-        : {}),
-    };
-    argErrors.push(detail);
-      options.addFailure({
-        kind: "diagnostic-collection",
-        operation: "console argument",
-        error: detail.error,
-        ...(detail.expectedLifecycle ? { expectedLifecycle: true } : {}),
-      });
-  }
   const item = {
     type: message.type(),
     text: safeText(message.text()),
-    args,
     location: safeBody(message.location()),
+    argumentSource: "console-call",
   };
-  if (argErrors.length) item.argument_collection_errors = argErrors;
   options.record("console", item);
   if (message.type() === "error" || message.type() === "warning") {
     options.addFailure({ kind: `console:${message.type()}`, ...item });
@@ -487,7 +793,7 @@ async function captureRequestFailure(request, options) {
   };
   const headers = await collect(
     "failed request headers",
-    () => request.allHeaders(),
+    () => readHeaders(request),
     context,
     options.addFailure
   );
@@ -509,13 +815,15 @@ async function captureRequestFailure(request, options) {
 
 export function installPageDiagnostics(
   page,
-  { record, addFailure, pending = [], binaryArtifactDir } = {}
+  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin, cdpStreams } = {}
 ) {
   let binarySequence = 0;
   const options = {
     record,
     addFailure,
     binaryArtifactDir,
+    mockResponseBodiesOrigin,
+    cdpStreams,
     nextBinaryArtifact: () => ++binarySequence,
   };
   const listeners = new Map();

@@ -5,11 +5,13 @@ import { useAuth } from "@/auth/useAuth";
 import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
 
+type ForgotPasswordError = { cause: unknown };
+
 export function ForgotPasswordPage() {
   const { resetPasswordForEmail } = useAuth();
   const [email, setEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ForgotPasswordError | null>(null);
   const [sent, setSent] = useState(false);
 
   async function handleSubmit(event: React.FormEvent) {
@@ -20,7 +22,7 @@ export function ForgotPasswordPage() {
       await resetPasswordForEmail(email);
       setSent(true);
     } catch (err) {
-      setError(describeError(err, "Could not send reset link"));
+      setError({ cause: err });
     } finally {
       setSubmitting(false);
     }
@@ -44,7 +46,11 @@ export function ForgotPasswordPage() {
       ) : (
         <Box component="form" onSubmit={handleSubmit} noValidate>
           <Stack spacing={2}>
-            {error ? <Alert severity="error">{error}</Alert> : null}
+            {error ? (
+              <Alert severity="error">
+                {describeError(error.cause, "Could not send reset link")}
+              </Alert>
+            ) : null}
             <TextField
               label="Email"
               type="email"
