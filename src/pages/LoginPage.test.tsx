@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "@/test/render";
 import { MOCK_USER } from "@/mocks/data";
+import { supabase } from "@/supabase";
 
 describe("LoginPage", () => {
   it("renders sign-in form", () => {
@@ -23,6 +24,20 @@ describe("LoginPage", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+  });
+
+  it("renders a fallback when authentication rejects with a falsy cause", async () => {
+    vi.spyOn(supabase.auth, "signInWithPassword").mockRejectedValueOnce(null as never);
+    renderApp("/login");
+    const user = userEvent.setup();
+
+    await user.type(screen.getByRole("textbox", { name: /email/i }), "wrong@example.com");
+    await user.type(screen.getByLabelText(/password/i), "badpass");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Authentication failed");
     });
   });
 

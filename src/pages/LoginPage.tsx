@@ -10,6 +10,7 @@ const PASSWORD_CHANGED_KEY = "devneya.passwordChanged";
 
 const DEMO_EMAIL = "demo@devneya.com";
 const DEMO_PASSWORD = "password123";
+type LoginError = { cause: unknown };
 
 function isLocalHost(): boolean {
   if (typeof window === "undefined") {
@@ -45,7 +46,7 @@ export function LoginPage() {
   const [email, setEmail] = useState(demoDefaults.email);
   const [password, setPassword] = useState(demoDefaults.password);
   const [mode, setMode] = useState<"signin" | "signup">("signin");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoginError | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [checkEmail, setCheckEmail] = useState<string | null>(null);
 
@@ -93,7 +94,7 @@ export function LoginPage() {
         }
       }
     } catch (err) {
-      setError(describeError(err, "Authentication failed"));
+      setError({ cause: err });
     } finally {
       setSubmitting(false);
     }
@@ -105,7 +106,7 @@ export function LoginPage() {
     try {
       await signInWithProvider(provider);
     } catch (err) {
-      setError(describeError(err, "Authentication failed"));
+      setError({ cause: err });
       setSubmitting(false);
     }
   }
@@ -123,7 +124,9 @@ export function LoginPage() {
           {initializationError ? (
             <Alert severity="error">Could not load your session: {initializationError.message}</Alert>
           ) : null}
-          {error ? <Alert severity="error">{error}</Alert> : null}
+          {error ? (
+            <Alert severity="error">{describeError(error.cause, "Authentication failed")}</Alert>
+          ) : null}
           <TextField
             label="Email"
             type="email"

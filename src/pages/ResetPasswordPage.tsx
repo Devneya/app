@@ -9,6 +9,7 @@ import { AuthShell } from "@/components/AuthShell";
 import { supabase } from "@/supabase";
 
 type PasswordStage = "none" | "password_changed" | "backend_logged_out";
+type ResetError = { cause: unknown; stage: PasswordStage };
 
 export function ResetPasswordPage() {
   const { session, updatePassword, signOut } = useAuth();
@@ -18,7 +19,7 @@ export function ResetPasswordPage() {
   const [confirm, setConfirm] = useState("");
   const [ready, setReady] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ResetError | null>(null);
   const [done, setDone] = useState(false);
   const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
   const passwordLogoutTokenRef = useRef<string | null>(null);
@@ -82,13 +83,7 @@ export function ResetPasswordPage() {
         navigate("/login", { replace: true });
       }
     } catch (err) {
-      setError(
-        stage === "backend_logged_out"
-          ? `Password changed and backend logout completed, but local sign-out failed: ${describeError(err)}`
-          : stage === "password_changed"
-            ? `Password changed, but backend logout failed: ${describeError(err)}`
-            : describeError(err, "Could not update password")
-      );
+      setError({ cause: err, stage });
     } finally {
       setSubmitting(false);
     }
@@ -118,7 +113,15 @@ export function ResetPasswordPage() {
       ) : (
         <Box component="form" onSubmit={handleSubmit} noValidate>
           <Stack spacing={2}>
-            {error ? <Alert severity="error">{error}</Alert> : null}
+            {error ? (
+              <Alert severity="error">
+                {error.stage === "backend_logged_out"
+                  ? `Password changed and backend logout completed, but local sign-out failed: ${describeError(error.cause)}`
+                  : error.stage === "password_changed"
+                    ? `Password changed, but backend logout failed: ${describeError(error.cause)}`
+                    : describeError(error.cause, "Could not update password")}
+              </Alert>
+            ) : null}
             {passwordStage === "none" ? (
               <>
                 <TextField

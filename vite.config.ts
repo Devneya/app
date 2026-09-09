@@ -28,6 +28,7 @@ export default defineConfig(({ command, mode }) => {
       environment: "jsdom",
       setupFiles: ["src/test/setup.ts"],
       css: true,
+      include: ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.test.mjs"],
       exclude: ["tests/e2e/**", "node_modules/**"],
       fileParallelism: false,
     },

@@ -1,5 +1,5 @@
-import { test, expect } from "@playwright/test";
-import { MOCK_USER, MOCK_VIRTUAL_KEY } from "../fixtures";
+import { expect } from "@playwright/test";
+import { MOCK_USER, MOCK_VIRTUAL_KEY, test } from "../fixtures";
 
 test.describe("auth flow", () => {
   test("login page snapshot", async ({ page }) => {

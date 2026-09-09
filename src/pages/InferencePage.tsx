@@ -49,10 +49,12 @@ function formatAccessUntil(iso: string): string {
   });
 }
 
+type CopyError = { cause: unknown };
+
 export function InferencePage() {
   const { session } = useAuth();
   const queryClient = useQueryClient();
-  const [copyError, setCopyError] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState<CopyError | null>(null);
   const token = session?.access_token ?? "";
   const userID = session?.user.id ?? "";
 
@@ -112,13 +114,13 @@ export function InferencePage() {
     }
     setCopyError(null);
     if (!navigator.clipboard) {
-      setCopyError("Clipboard access is unavailable.");
+      setCopyError({ cause: "Clipboard access is unavailable." });
       return;
     }
     try {
       await navigator.clipboard.writeText(keyQuery.data.key);
     } catch (error) {
-      setCopyError(describeError(error, "Clipboard access was denied."));
+      setCopyError({ cause: error });
     }
   }
 
@@ -139,7 +141,15 @@ export function InferencePage() {
               {describeError(actionError)}
             </Alert>
           ) : null}
-          {copyError ? <Alert severity="error">Could not copy API key: {copyError}</Alert> : null}
+          {copyError ? (
+            <Alert severity="error">
+              Could not copy API key: {
+                typeof copyError.cause === "string"
+                  ? copyError.cause
+                  : describeError(copyError.cause, "Clipboard access was denied.")
+              }
+            </Alert>
+          ) : null}
 
           <Section title="API key">
             {keyQuery.isLoading ? (
