@@ -63,6 +63,7 @@ function isLikelyCard(value) {
 export function safeUrl(value) {
   try {
     const url = new URL(String(value));
+    if (url.protocol === "blob:") return `blob:${safeUrl(url.pathname + url.search)}`;
     const query = safeUrlQuery(url);
     if (/(^|\.)checkout\.dodopayments\.com$/.test(url.hostname) && /^\/[^/.]+\/?$/.test(url.pathname)) {
       return `${url.origin}/[redacted-capability]${query ? `?${query}` : ""}`;
