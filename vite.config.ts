@@ -21,9 +21,6 @@ export default defineConfig(({ command, mode }) => {
     resolve: {
       tsconfigPaths: true,
     },
-    server: {
-      port: 5173,
-    },
     test: {
       environment: "jsdom",
       setupFiles: ["src/test/setup.ts"],

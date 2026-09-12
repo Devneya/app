@@ -54,6 +54,67 @@ afterEach(() => {
 });
 
 describe("AuthProvider response validation", () => {
+  it("sends signup confirmation to this app's confirmation page", async () => {
+    const data = { user: testUser, session: null };
+    const signUp = vi.spyOn(supabase.auth, "signUp").mockResolvedValue({
+      data: data as never,
+      error: null,
+    });
+    const { result } = await renderAuth();
+
+    await expect(result.current.signUp("user@example.com", "password123")).resolves.toEqual({
+      needsEmailConfirmation: true,
+    });
+    expect(signUp).toHaveBeenCalledWith({
+      email: "user@example.com",
+      password: "password123",
+      options: { emailRedirectTo: `${window.location.origin}/auth/confirm` },
+    });
+  });
+
+  it("does not require confirmation when signup returns a session", async () => {
+    const data = { user: testUser, session: testSession };
+    const signUp = vi.spyOn(supabase.auth, "signUp").mockResolvedValue({
+      data: data as never,
+      error: null,
+    });
+    const { result } = await renderAuth();
+
+    await expect(result.current.signUp("user@example.com", "password123")).resolves.toEqual({
+      needsEmailConfirmation: false,
+    });
+    expect(signUp).toHaveBeenCalledWith({
+      email: "user@example.com",
+      password: "password123",
+      options: { emailRedirectTo: `${window.location.origin}/auth/confirm` },
+    });
+  });
+
+  it("sends email-change confirmation to this app's confirmation page", async () => {
+    const updateUser = vi.spyOn(supabase.auth, "updateUser").mockResolvedValue({
+      data: { user: testUser } as never,
+      error: null,
+    });
+    const { result } = await renderAuth(testSession);
+
+    await expect(result.current.updateEmail("  next@example.com  ")).resolves.toBeUndefined();
+    expect(updateUser).toHaveBeenCalledWith(
+      { email: "next@example.com" },
+      { emailRedirectTo: `${window.location.origin}/auth/confirm` }
+    );
+  });
+
+  it("propagates email-change provider errors", async () => {
+    const providerError = new Error("provider failure");
+    vi.spyOn(supabase.auth, "updateUser").mockResolvedValue({
+      data: { user: null } as never,
+      error: providerError as never,
+    });
+    const { result } = await renderAuth(testSession);
+
+    await expect(result.current.updateEmail("next@example.com")).rejects.toBe(providerError);
+  });
+
   it("preserves the update response when no user is returned", async () => {
     const data = { user: null, marker: "update-response" };
     vi.spyOn(supabase.auth, "updateUser").mockResolvedValue({

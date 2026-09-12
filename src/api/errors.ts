@@ -135,12 +135,25 @@ export async function readApiResponse(response: Response): Promise<unknown> {
   return parsed.value;
 }
 
-export function describeError(error: unknown, fallback = "Request failed"): string {
-  if (!(error instanceof Error) || !error.message || error.message === "{}") {
+function errorMessage(message: string | undefined, fallback: string): string {
+  if (!message) {
     return fallback;
   }
-  if (error instanceof ApiRequestError && error.requestId) {
-    return `${error.message} (Request ID: ${error.requestId})`;
+
+  try {
+    const value: unknown = JSON.parse(message);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return message;
+    }
+    const text = (value as { message?: unknown }).message;
+    return typeof text === "string" && text.trim() ? text : fallback;
+  } catch {
+    return message;
   }
-  return error.message;
+}
+
+export function describeError(error: unknown, fallback = "Request failed"): string {
+  const message = errorMessage(error instanceof Error ? error.message : undefined, fallback);
+  const requestId = error instanceof ApiRequestError ? error.requestId?.trim() : undefined;
+  return requestId ? `${message} (Request ID: ${requestId})` : message;
 }

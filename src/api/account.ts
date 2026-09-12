@@ -8,23 +8,7 @@ import type {
 import { readApiResponse } from "@/api/errors";
 import { config } from "@/config";
 
-const subscriptionStatuses: SubscriptionStatus[] = [
-  "none",
-  "pending",
-  "active",
-  "past_due",
-  "cancelled",
-  "expired",
-  "review_required",
-];
-
-const billingActions: UsageResponse["required_billing_action"][] = [
-  "subscribe",
-  "none",
-  "uncancel",
-  "update_payment",
-  "contact_support",
-];
+import { subscriptionStatuses, billingActions } from "@/api/types";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -90,11 +74,11 @@ function parseCancellation(value: unknown): CancelSubscriptionResponse {
   };
 }
 
-async function apiFetch<T>(
+async function apiFetch(
   path: string,
   accessToken: string,
   init?: RequestInit
-): Promise<T> {
+): Promise<unknown> {
   const resp = await fetch(`${config.apiBaseUrl}${path}`, {
     ...init,
     headers: {
@@ -103,11 +87,11 @@ async function apiFetch<T>(
       ...init?.headers,
     },
   });
-  return (await readApiResponse(resp)) as T;
+  return readApiResponse(resp);
 }
 
 export function fetchVirtualKey(accessToken: string): Promise<KeyResponse> {
-  return apiFetch<unknown>("/account/key", accessToken).then((value) => {
+  return apiFetch("/account/key", accessToken).then((value) => {
     if (!isRecord(value)) {
       throw invalidResponse("API key", value);
     }
@@ -116,7 +100,7 @@ export function fetchVirtualKey(accessToken: string): Promise<KeyResponse> {
 }
 
 export async function fetchUsage(accessToken: string): Promise<UsageResponse> {
-  const value = await apiFetch<unknown>("/account/usage", accessToken);
+  const value = await apiFetch("/account/usage", accessToken);
   if (!isRecord(value)) {
     throw invalidResponse("Usage", value);
   }
@@ -137,7 +121,7 @@ export async function fetchUsage(accessToken: string): Promise<UsageResponse> {
 }
 
 export async function startSubscription(accessToken: string): Promise<SubscribeResponse> {
-  const value = await apiFetch<unknown>("/account/subscribe", accessToken, {
+  const value = await apiFetch("/account/subscribe", accessToken, {
     method: "POST",
   });
   if (!isRecord(value) || value.status !== "checkout") {
@@ -154,7 +138,7 @@ export async function startSubscription(accessToken: string): Promise<SubscribeR
 export function cancelSubscription(
   accessToken: string
 ): Promise<CancelSubscriptionResponse> {
-  return apiFetch<unknown>("/account/subscribe/cancel", accessToken, {
+  return apiFetch("/account/subscribe/cancel", accessToken, {
     method: "POST",
   }).then(parseCancellation);
 }
@@ -162,13 +146,13 @@ export function cancelSubscription(
 export function uncancelSubscription(
   accessToken: string
 ): Promise<CancelSubscriptionResponse> {
-  return apiFetch<unknown>("/account/subscribe/uncancel", accessToken, {
+  return apiFetch("/account/subscribe/uncancel", accessToken, {
     method: "POST",
   }).then(parseCancellation);
 }
 
 export async function createBillingPortal(accessToken: string): Promise<{ portal_url: string }> {
-  const value = await apiFetch<unknown>("/account/billing/portal", accessToken, {
+  const value = await apiFetch("/account/billing/portal", accessToken, {
     method: "POST",
   });
   if (!isRecord(value)) {
@@ -181,7 +165,7 @@ export async function createBillingPortal(accessToken: string): Promise<{ portal
 }
 
 export async function logout(accessToken: string): Promise<{ status: "logged_out" }> {
-  const value = await apiFetch<unknown>("/account/logout", accessToken, { method: "POST" });
+  const value = await apiFetch("/account/logout", accessToken, { method: "POST" });
   if (!isRecord(value) || value.status !== "logged_out") {
     throw invalidResponse("Logout", value);
   }
@@ -189,7 +173,7 @@ export async function logout(accessToken: string): Promise<{ status: "logged_out
 }
 
 export async function deleteAccount(accessToken: string): Promise<{ status: "deleted" }> {
-  const value = await apiFetch<unknown>("/account", accessToken, { method: "DELETE" });
+  const value = await apiFetch("/account", accessToken, { method: "DELETE" });
   if (!isRecord(value) || value.status !== "deleted") {
     throw invalidResponse("Account deletion", value);
   }
