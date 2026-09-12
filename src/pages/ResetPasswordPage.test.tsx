@@ -1,4 +1,3 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
@@ -13,14 +12,11 @@ const testUser = { id: "recovery-user", email: "recovery@example.com" } as unkno
 const testSession = { access_token: "recovery-token", user: testUser } as unknown as Session;
 
 function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <AppProviders>
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <ResetPasswordPage />
-        </MemoryRouter>
-      </QueryClientProvider>
+      <MemoryRouter>
+        <ResetPasswordPage />
+      </MemoryRouter>
     </AppProviders>
   );
 }

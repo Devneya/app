@@ -31,6 +31,9 @@ function formatEur(value: number): string {
     return "€0.00";
   }
   const abs = Math.abs(value);
+  if (abs < 0.000001) {
+    return value > 0 ? "<€0.000001" : ">−€0.000001";
+  }
   if (abs < 0.01) {
     const digits = Math.min(6, Math.max(4, Math.ceil(-Math.log10(abs)) + 1));
     return `€${value.toFixed(digits)}`;

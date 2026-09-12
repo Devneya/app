@@ -26,7 +26,7 @@ export function AuthConfirmPage() {
     if (!error && !description) {
       return null;
     }
-    return description?.replace(/\+/g, " ") || error || "Confirmation failed";
+    return description || error || "Confirmation failed";
   }, []);
 
   useEffect(() => {

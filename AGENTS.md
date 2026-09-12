@@ -45,14 +45,14 @@ All must pass. Do not rely on manual browser review alone.
 - MSW handlers live in `src/mocks/handlers/` — keep shapes aligned with `Devneya/api/openapi.yaml`.
 - Reset mock state between tests via `resetMockSession()` / `setMockSubscribed()`.
 
-### Coverage TODO (2026-08-07)
+### Auth coverage
 
-Increase tests for recent auth/inference work — tracked in
-`control-plane/docs/open-items.md`:
-
-- `AuthConfirmPage` (success / error hash states)
-- Sub-cent usage formatting (`formatUsd` must not round tiny spend to `$0.00`)
-- Signup / email-change `emailRedirectTo` → `/auth/confirm` (mock or e2e)
+- `AuthProvider.test.tsx` verifies signup redirects to `/auth/confirm` with and
+  without an immediate session, and trimmed email changes redirect there while
+  propagating provider errors.
+- `AuthConfirmPage.test.tsx` covers success and error hashes, session loading,
+  history replacement, decoded error descriptions, the no-session timeout, and
+  the sign-in route.
 
 ## Mock credentials (MSW mode)
 
@@ -69,7 +69,7 @@ Required repository secret:
 
 - `VITE_GOTRUE_ANON_KEY` — same value as playground's `VITE_SUPABASE_PUBLIC_KEY` (GoTrue anon/public key from the VM deploy env).
 
-Also requires GitHub Pages enabled for the repo and (when ready) a custom domain CNAME for `app.devneya.com`.
+GitHub Pages serves production at `app.devneya.com`; DNS and Pages custom-domain settings are managed outside this repository.
 
 ## Auth note
 

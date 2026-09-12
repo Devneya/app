@@ -1,11 +1,11 @@
-export type SubscriptionStatus =
-  | "none"
-  | "pending"
-  | "active"
-  | "past_due"
-  | "cancelled"
-  | "expired"
-  | "review_required";
+export const subscriptionStatuses = [
+  "none", "pending", "active", "past_due", "cancelled", "expired", "review_required",
+] as const;
+export type SubscriptionStatus = (typeof subscriptionStatuses)[number];
+
+export const billingActions = [
+  "subscribe", "none", "uncancel", "update_payment", "contact_support",
+] as const;
 
 export type UsageResponse = {
   used: number;
@@ -14,7 +14,7 @@ export type UsageResponse = {
   entitlement_status: SubscriptionStatus;
   cancel_at_period_end: boolean;
   access_until: string | null;
-  required_billing_action: "subscribe" | "none" | "uncancel" | "update_payment" | "contact_support";
+  required_billing_action: (typeof billingActions)[number];
 };
 
 export type SubscribeResponse = {
@@ -33,16 +33,14 @@ export type KeyResponse = {
   key: string;
 };
 
-export type ApiError = { error: { code: string; message: string; request_id: string } };
-
 export type ModelObject = {
   id: string;
-  object: "model" | string;
+  object: string;
   created: number;
   owned_by: string;
 };
 
 export type ModelsListResponse = {
-  object: "list" | string;
+  object: string;
   data: ModelObject[];
 };

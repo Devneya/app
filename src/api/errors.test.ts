@@ -1,5 +1,61 @@
 import { describe, expect, it } from "vitest";
-import { ApiRequestError, readApiResponse } from "@/api/errors";
+import { ApiRequestError, describeError, readApiResponse } from "@/api/errors";
+
+describe("describeError", () => {
+  it("keeps ordinary error text", () => {
+    expect(describeError(new Error("The request was rejected."))).toBe("The request was rejected.");
+  });
+
+  it("uses a useful top-level message from a serialized object", () => {
+    expect(describeError(new Error('{"message":"The session expired."}'))).toBe(
+      "The session expired."
+    );
+  });
+
+  it.each(['{}', '{"url":"https://auth.example.test/recover"}'])(
+    "uses the fallback for diagnostic-only serialized objects (%s)",
+    (message) => {
+      expect(describeError(new Error(message), "Please try again.")).toBe("Please try again.");
+    }
+  );
+
+  it("keeps a request ID when using the fallback", () => {
+    const error = new ApiRequestError(
+      503,
+      { error: { message: '{"url":"https://auth.example.test/recover"}', request_id: "req_42" } },
+      ""
+    );
+
+    expect(describeError(error, "Authentication is temporarily unavailable.")).toBe(
+      "Authentication is temporarily unavailable. (Request ID: req_42)"
+    );
+  });
+
+  it("retains response diagnostics and cause when formatting the user message", () => {
+    const body = {
+      error: {
+        message: '{"url":"https://auth.example.test/recover"}',
+        request_id: "req_43",
+      },
+    };
+    const cause = new Error("provider response details");
+    const error = new ApiRequestError(
+      503,
+      body,
+      JSON.stringify(body),
+      cause,
+      { "x-request-id": "req_header" }
+    );
+
+    expect(describeError(error, "Authentication is temporarily unavailable.")).toBe(
+      "Authentication is temporarily unavailable. (Request ID: req_43)"
+    );
+    expect(error.cause).toBe(cause);
+    expect(error.responseBody).toBe(body);
+    expect(error.responseText).toBe(JSON.stringify(body));
+    expect(error.responseHeaders.get("x-request-id")).toBe("req_header");
+  });
+});
 
 describe("ApiRequestError", () => {
   it("retains the structured API error and response metadata", async () => {

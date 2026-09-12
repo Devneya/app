@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { installConsoleCapture } from "./console-capture.mjs";
+import { captureChildSessions } from "./frame-sessions.mjs";
+import { installBlobCapture } from "./blob-capture.mjs";
 
 const SENSITIVE_KEY =
   /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|x-(?:amz|goog)-[\w-]+|card[_-]?number|cvv|cvc|email)(?:$|[_-])/i;
@@ -297,10 +299,9 @@ function responseIsMainFrame(response, addFailure) {
   }
 }
 
-function createCdpStreamCapture(session, rootFrameId, { pending, record, addFailure, binaryArtifactDir }) {
+function createCdpStreamCapture(session, rootFrameId, { pending, record, addFailure, binaryArtifactDir, nextBinaryArtifact }) {
   const entries = new Map();
   const listeners = new Map();
-  let binarySequence = 0;
 
   const listen = (event, listener) => {
     session.on(event, listener);
@@ -348,7 +349,7 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
       const serialized = await serializeResponseBody(bytes, responseHeaders, context, {
         binaryArtifactDir,
         binaryPrefix: "cdp-response",
-        nextBinaryArtifact: () => ++binarySequence,
+        nextBinaryArtifact,
         addFailure,
       });
       const request = {
@@ -369,16 +370,18 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
         requestHeaders: safeHeaders(entry.requestHeaders ?? {}),
         headers: safeHeaders(responseHeaders),
         requestBody: requestData,
-        body: entry.errors.length && bytes.byteLength === 0
+        body: entry.redirect ? { unavailable: true, reason: "Chromium does not expose redirect response bodies; the request ID is reused for the next hop", observedStreamBytes: serialized.body }
+          : !entry.bodyCaptureComplete && entry.errors.length && bytes.byteLength === 0
           ? { collection_error: entry.errors.map(error => safeError(error)), partialByteLength: 0 }
           : serialized.body,
-        mainFrame: true,
+        mainFrame: entry.frameId === rootFrameId,
         ...(context.fromServiceWorker !== undefined
           ? { fromServiceWorker: context.fromServiceWorker }
           : {}),
         captureSource: "cdp-stream",
         streamComplete: entry.finished && !entry.loadingFailed && entry.streamMethodSucceeded === true,
         bodyCaptureComplete: entry.bodyCaptureComplete === true && !entry.loadingFailed,
+        availableBodyCaptureComplete: entry.bodyCaptureComplete === true && (entry.finished || entry.loadingError !== undefined),
         bodyCaptureMethod: entry.bodyCaptureMethod,
         cdpStream: {
           requestId: entry.requestId,
@@ -441,6 +444,15 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
         entry.bodyCaptureMethod = "Network.streamResourceContent";
       })
       .catch(async error => {
+        await entry.done;
+        if (entry.redirect || entry.method === "HEAD" || [204, 304].includes(entry.response?.status)) {
+          retainEntryError(entry, error);
+          entry.bodyCaptureComplete = !entry.redirect;
+          entry.bodyCaptureMethod = "HTTP bodyless response";
+          record("capture-method", { operation: "CDP response stream", requestId: entry.requestId,
+            url: safeUrl(entry.url), error: safeError(error), reason: entry.redirect ? "redirect body unavailable in Chromium" : "HTTP response has no body" });
+          return;
+        }
         const alreadyFinished = /Request with the provided ID has already finished loading/i.test(error?.message ?? "");
         if (!alreadyFinished) {
           addEntryFailure(entry, error);
@@ -484,7 +496,11 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
   };
 
   listen("Network.requestWillBeSent", event => {
-    if (event.frameId !== rootFrameId) return;
+    // Blob bytes are captured at creation, not read from the network body store.
+    if (event.request?.url?.startsWith("blob:")) return;
+    // Cross-process navigation and initial scripts belong to Playwright's
+    // existing session; they can start before this session enables Network.
+    if (["Document", "Script"].includes(event.type) && event.frameId !== rootFrameId) return;
     const previous = entries.get(event.requestId);
     if (previous && !previous.settled) {
       if (event.redirectResponse) {
@@ -495,8 +511,7 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
           mimeType: event.redirectResponse.mimeType,
           fromServiceWorker: event.redirectResponse.fromServiceWorker,
         };
-        const error = new Error("CDP stream ended at a redirect before its final response body was available");
-        addEntryFailure(previous, error, "CDP redirect response stream");
+        previous.redirect = true;
         finish(previous, "failed");
       } else {
         addEntryFailure(previous, new Error("CDP request identifier was reused before its stream finished"));
@@ -534,7 +549,9 @@ function createCdpStreamCapture(session, rootFrameId, { pending, record, addFail
     const error = new Error(event.errorText || "Network loading failed");
     if (event.canceled !== undefined) error.canceled = event.canceled;
     entry.loadingError = error;
-    addEntryFailure(entry, error, "CDP response loading");
+    retainEntryError(entry, error);
+    addFailure({ kind: "requestfailed", operation: "CDP response loading",
+      requestId: entry.requestId, url: safeUrl(entry.url), method: entry.method, error: safeError(error) });
     finish(entry, "failed");
   });
 
@@ -565,23 +582,58 @@ export async function configurePageCapture(
       addFailure({ kind: "diagnostic-collection", operation: "console source snapshot", ...safe });
     }
   });
+  let blobSequence = 0;
+  await installBlobCapture(page, payload => track(pending, "blob source capture", (async () => {
+    if (payload.error) {
+      addFailure({ kind: "diagnostic-collection", operation: "blob source capture", url: safeUrl(payload.url), error: safeBody(payload.error) });
+      return;
+    }
+    const serialized = await serializeResponseBody(Buffer.from(payload.base64, "base64"),
+      { "content-type": payload.contentType }, { url: safeUrl(payload.url) }, {
+        binaryArtifactDir, binaryPrefix: "blob-source", nextBinaryArtifact: () => ++blobSequence, addFailure,
+      });
+    record("blob-source", { blobId: createHash("sha256").update(payload.url).digest("hex"),
+      url: safeUrl(payload.url), contentType: payload.contentType, body: serialized.body });
+  })(), { url: safeUrl(payload.url) }, addFailure));
   const session = await page.context().newCDPSession(page);
   const frameTree = await session.send("Page.getFrameTree");
-  const rootFrameId = frameTree.frameTree.frame.id;
+  const rootFrameId = frameTree?.frameTree?.frame?.id;
+  if (typeof rootFrameId !== "string" || !rootFrameId) {
+    throw new Error("Page.getFrameTree returned no root frame ID", { cause: safeBody(frameTree) });
+  }
   await session.send("Network.enable");
   await session.send("Network.setCacheDisabled", { cacheDisabled: true });
-  const cdpStreams = createCdpStreamCapture(session, rootFrameId, {
+  let binarySequence = 0;
+  const options = {
     pending,
     record,
     addFailure,
     binaryArtifactDir,
+    nextBinaryArtifact: () => ++binarySequence,
+  };
+  const cdpStreams = createCdpStreamCapture(session, rootFrameId, options);
+  const reportFailure = error => addFailure({
+    kind: "diagnostic-collection", operation: "child CDP session", error: safeError(error),
   });
+  const configureChild = child => {
+    const streams = createCdpStreamCapture(child, rootFrameId, options);
+    let closeChildren = () => {};
+    track(pending, "configure child CDP capture", (async () => {
+      await child.send("Network.enable");
+      await child.send("Network.setCacheDisabled", { cacheDisabled: true });
+      closeChildren = await captureChildSessions(child, configureChild, reportFailure);
+    })(), {}, addFailure);
+    return () => { closeChildren(); streams.close(); };
+  };
+  const closeChildren = await captureChildSessions(session, configureChild, reportFailure);
+  const closeRoot = cdpStreams.close;
+  cdpStreams.close = () => { closeChildren(); closeRoot(); };
 
   return {
     browserCache: "disabled",
     cacheCoverage: "not-covered",
     cdpBodyCapture: "streamResourceContent",
-    cdpBodyCoverage: "main-frame-only",
+    cdpBodyCoverage: "page/frame/worker streams; Playwright captures child network documents and scripts; blob bytes captured at creation",
     rootFrameId,
     cdpStreams,
   };
@@ -621,9 +673,11 @@ export function missingMockResponses(observations) {
 }
 
 export function missingCdpStreamResponses(observations) {
+  const blobIds = new Set(observations.filter(item => item.kind === "blob-source").map(item => item.blobId));
+  const missingBlobs = observations.filter(item => item.kind === "http" && item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId));
   const counts = new Map();
   for (const item of observations) {
-    if (item.kind !== "http" || item.mainFrame !== true) continue;
+    if (item.kind !== "http") continue;
     if (item.status >= 300 && item.status <= 399) continue;
     const source = item.captureSource === "cdp-stream";
     const placeholder = item.body?.captureSource === "cdp-stream";
@@ -635,12 +689,13 @@ export function missingCdpStreamResponses(observations) {
       capturedBodies: 0,
     };
     if (placeholder) count.observedResponses += 1;
-    if (source && item.bodyCaptureComplete === true) count.capturedBodies += 1;
+    if (source && (item.bodyCaptureComplete === true || item.availableBodyCaptureComplete === true)) count.capturedBodies += 1;
     counts.set(key, count);
   }
   return [...counts.values()]
     .filter(count => count.observedResponses > 0)
-    .filter(count => count.observedResponses > count.capturedBodies);
+    .filter(count => count.observedResponses > count.capturedBodies)
+    .concat(missingBlobs.map(item => ({ response: [item.method, item.url, item.status], observedResponses: 1, capturedBodies: 0 })));
 }
 
 async function serializeResponseBody(responseBody, responseHeaders, context, options) {
@@ -726,12 +781,14 @@ async function captureResponse(response, options) {
   const responseBodyTask = options.mockResponseBodiesOrigin && context.fromServiceWorker &&
     new URL(response.url()).origin === options.mockResponseBodiesOrigin
     ? Promise.resolve({ captureSource: "msw-response:mocked" })
+    : options.cdpStreams && response.url().startsWith("blob:")
+    ? Promise.resolve({ captureSource: "blob-source", blobId: createHash("sha256").update(response.url()).digest("hex") })
     : redirectResponse
     ? Promise.resolve({
         unavailable: true,
         reason: "Playwright does not expose response bodies for 3xx responses",
       })
-    : mainFrame === true && options.cdpStreams
+    : options.cdpStreams && (mainFrame === true || !["document", "script"].includes(request.resourceType()))
     ? Promise.resolve({ captureSource: "cdp-stream" })
     : collect(
         "response body",
@@ -782,6 +839,9 @@ async function captureConsole(message, options) {
   options.record("console", item);
   if (message.type() === "error" || message.type() === "warning") {
     options.addFailure({ kind: `console:${message.type()}`, ...item });
+  }
+  if (message.text() === "Blob source capture failed") {
+    options.addFailure({ kind: "diagnostic-collection", operation: "blob source binding", ...item });
   }
 }
 

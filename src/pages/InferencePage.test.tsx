@@ -77,6 +77,29 @@ describe("InferencePage", () => {
     });
   });
 
+  it.each([
+    [0, "€0.00"],
+    [0.000012, "€0.000012"],
+    [0.00000001, "<€0.000001"],
+  ])("displays usage %s without rounding positive spend to zero", async (used, formatted) => {
+    server.use(
+      http.get(`${config.apiBaseUrl}/account/usage`, () => HttpResponse.json({
+        used,
+        limit: 10,
+        subscription_status: "active",
+        entitlement_status: "active",
+        cancel_at_period_end: false,
+        access_until: null,
+        required_billing_action: "none",
+      }))
+    );
+    renderApp("/login");
+    await signInViaUi();
+    await waitFor(() => {
+      expect(screen.getByText(/Spent:/)).toHaveTextContent(`Spent: ${formatted} / €10.00`);
+    });
+  });
+
   it("schedules cancel at period end while staying active", async () => {
     setMockSubscribed(true);
     renderApp("/login");

@@ -47,10 +47,6 @@ export function setMockBillingState(
   billingOverride = { status, action, cancelAtPeriodEnd };
 }
 
-export function getMockPassword(): string {
-  return mockPassword;
-}
-
 function unauthorized() {
   return HttpResponse.json({ error: "unauthorized" }, { status: 401 });
 }
@@ -70,7 +66,7 @@ function requireAuth(request: Request): string | null {
 const authBase = authBaseUrl();
 const apiBase = config.apiBaseUrl;
 
-export const authHandlers = [
+const authHandlers = [
   http.post(`${authBase}/signup`, async ({ request }) => {
     const body = (await request.json()) as { email?: string; password?: string };
     if (!body.email || !body.password || body.password.length < 6) {
@@ -151,7 +147,7 @@ export const authHandlers = [
   http.post(`${authBase}/logout`, () => HttpResponse.json({}, { status: 200 })),
 ];
 
-export const llmHandlers = [
+const llmHandlers = [
   http.get(`${apiBase}/llm/v1/models`, () => {
     const now = Math.floor(Date.now() / 1000);
     return HttpResponse.json({
@@ -166,7 +162,7 @@ export const llmHandlers = [
   }),
 ];
 
-export const accountHandlers = [
+const accountHandlers = [
   http.get(`${apiBase}/account/key`, ({ request }) => {
     if (!requireAuth(request)) {
       return unauthorized();

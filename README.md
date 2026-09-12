@@ -37,7 +37,6 @@ npm run test:e2e
 | Variable | Purpose |
 |----------|---------|
 | `VITE_API_BASE_URL` | `devneya-api` base URL |
-| `VITE_GOTRUE_URL` | GoTrue auth base URL |
 | `VITE_GOTRUE_ANON_KEY` | GoTrue anon/public key |
 | `VITE_USE_MOCKS` | Enable MSW (`true` for local dev and CI) |
 
@@ -49,4 +48,4 @@ Production build uses `VITE_USE_MOCKS=false`, `VITE_API_BASE_URL=https://api.dev
 
 The build copies `dist/index.html` to `dist/404.html` for SPA deep-link fallback on Pages.
 
-Custom domain `app.devneya.com` is planned; DNS CNAME and Pages custom-domain wiring are operator steps (documented in control-plane).
+GitHub Pages serves the production app at `app.devneya.com`; DNS and Pages custom-domain settings are managed outside this repository.

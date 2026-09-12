@@ -42,6 +42,10 @@ export function AccountPage() {
   const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
   const passwordLogoutTokenRef = useRef<string | null>(null);
 
+  const nameDirty = displayName.trim() !== savedName.trim();
+  const emailDirty = email.trim().toLowerCase() !== accountEmail.toLowerCase();
+  const profileDirty = nameDirty || emailDirty;
+
   const profileMutation = useMutation({
     mutationFn: async () => {
       const nextName = displayName.trim();
@@ -49,11 +53,8 @@ export function AccountPage() {
       if (!nextEmail) {
         throw new Error("Email is required");
       }
-      const nameChanged = nextName !== savedName.trim();
-      const emailChanged = nextEmail.toLowerCase() !== accountEmail.toLowerCase();
-      if (!nameChanged && !emailChanged) {
-        return { nameChanged: false, emailChanged: false, nextEmail };
-      }
+      const nameChanged = nameDirty;
+      const emailChanged = emailDirty;
       if (nameChanged) {
         await updateDisplayName(nextName);
       }
@@ -63,9 +64,6 @@ export function AccountPage() {
       return { nameChanged, emailChanged, nextEmail };
     },
     onSuccess: (result) => {
-      if (!result) {
-        return;
-      }
       setDisplayName(displayName.trim());
       if (result.emailChanged) {
         setPendingEmail(result.nextEmail);
@@ -129,22 +127,16 @@ export function AccountPage() {
     },
   });
 
-  const nameDirty = displayName.trim() !== savedName.trim();
-  const emailDirty = email.trim().toLowerCase() !== accountEmail.toLowerCase();
-  const profileDirty = nameDirty || emailDirty;
-
   return (
     <>
       <AppChrome section="account" />
 
       <Container maxWidth="md" sx={{ mt: 4, mb: 6 }}>
         <Stack spacing={3}>
-          {deleteMutation.error ? (
-            !deletionCompleted ? (
-              <Alert severity="error">
-                {describeError(deleteMutation.error, "Could not delete account")}
-              </Alert>
-            ) : null
+          {deleteMutation.error && !deletionCompleted ? (
+            <Alert severity="error">
+              {describeError(deleteMutation.error, "Could not delete account")}
+            </Alert>
           ) : null}
 
           <Section title="Profile">
