@@ -1,4 +1,4 @@
-/* global Buffer */
+/* global Buffer, URL */
 
 import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -9,6 +9,7 @@ import {
   closeCapturedPage,
   drainPending,
   drainBeforeClose,
+  installSubscribeResponseCapture,
   installPageDiagnostics,
   captureMockResponse,
   missingResponseBodies,
@@ -49,6 +50,178 @@ function fakeRequest(overrides = {}) {
 }
 
 describe("browser diagnostics", () => {
+  it("captures each exact subscription POST once and continues other matching traffic", async () => {
+    let routeHandler;
+    let routeMatcher;
+    const page = Object.assign(fakePage(), {
+      route: vi.fn(async (matcher, handler) => { routeMatcher = matcher; routeHandler = handler; }),
+      unroute: vi.fn(async () => {}),
+    });
+    const failures = [];
+    const pending = [];
+    const capture = await installSubscribeResponseCapture(page, {
+      apiOrigin: "https://api.example.test",
+      pending,
+      addFailure: failure => failures.push(failure),
+    });
+    const request = fakeRequest({
+      url: () => "https://api.example.test/account/subscribe",
+      postData: () => "{\"price_id\":\"safe\"}",
+    });
+    const bytes = Buffer.from('{"marker":"exact-request","checkout_url":"https://pay.example.test/private"}');
+    const upstream = {
+      status: () => 201,
+      headers: () => ({ "content-type": "application/json" }),
+      body: vi.fn(async () => bytes),
+      dispose: vi.fn(async () => {}),
+    };
+    const route = {
+      request: () => request,
+      fetch: vi.fn(async options => {
+        expect(options).toMatchObject({ maxRedirects: 0, maxRetries: 0 });
+        return upstream;
+      }),
+      fulfill: vi.fn(async () => {}),
+      continue: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+    };
+
+    expect(routeMatcher(new URL("https://api.example.test/account/subscribe"))).toBe(true);
+    expect(routeMatcher(new URL("https://api.example.test/account/subscribe/other"))).toBe(false);
+    expect(routeMatcher(new URL("https://other.example.test/account/subscribe"))).toBe(false);
+    expect(routeMatcher(new URL("https://api.example.test/account/subscribe?token=private"))).toBe(true);
+    await routeHandler(route);
+    const result = await capture.responseBodies.get(request);
+    expect(result).toEqual({
+      ok: true,
+      status: 201,
+      headers: { "content-type": "application/json" },
+      bytes,
+    });
+    expect(route.fetch).toHaveBeenCalledTimes(1);
+    expect(route.fulfill).toHaveBeenCalledWith({ response: upstream });
+    expect(upstream.body).toHaveBeenCalledTimes(1);
+    expect(route.abort).not.toHaveBeenCalled();
+
+    const getRequest = fakeRequest({
+      method: () => "GET",
+      url: () => "https://api.example.test/account/subscribe",
+    });
+    await routeHandler({ ...route, request: () => getRequest });
+    expect(route.continue).toHaveBeenCalledTimes(1);
+    expect(capture.responseBodies.has(getRequest)).toBe(false);
+    await drainPending(pending);
+    await capture.remove();
+    expect(page.unroute).toHaveBeenCalledWith(routeMatcher, routeHandler);
+    expect(failures).toEqual([]);
+  });
+
+  it("fails a subscription route capture explicitly and still releases the route", async () => {
+    let routeHandler;
+    const page = Object.assign(fakePage(), {
+      route: async (_matcher, handler) => { routeHandler = handler; },
+      unroute: async () => {},
+    });
+    const failures = [];
+    const request = fakeRequest({ url: () => "https://api.example.test/account/subscribe" });
+    const route = {
+      request: () => request,
+      fetch: async () => { throw new Error("upstream unavailable"); },
+      fulfill: vi.fn(async () => {}),
+      continue: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}),
+    };
+    const capture = await installSubscribeResponseCapture(page, {
+      apiOrigin: "https://api.example.test",
+      addFailure: failure => failures.push(failure),
+    });
+
+    await routeHandler(route);
+    expect(await capture.responseBodies.get(request)).toMatchObject({ ok: false });
+    expect(route.abort).toHaveBeenCalledTimes(1);
+    expect(route.fulfill).not.toHaveBeenCalled();
+    expect(failures).toMatchObject([{ kind: "diagnostic-collection", operation: "subscription response route" }]);
+  });
+
+  it("attributes console errors to the emitting document, not the script URL", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: failure => failures.push(failure),
+    });
+    const emitConsole = (text, resourceUrl, documentOrigin) => page.emit("console", {
+      type: () => "error",
+      text: () => text,
+      location: () => ({ url: resourceUrl }),
+      args: () => [{ evaluate: async callback => callback() && documentOrigin }],
+    });
+    await emitConsole(
+      "external script error",
+      "https://cdn.example.test/bundle.js",
+      "https://app.example.test",
+    );
+    await emitConsole(
+      "iframe error",
+      "https://checkout.example.test/frame.html",
+      "https://checkout.example.test",
+    );
+    await drainPending(pending);
+
+    const consoleFailures = failures.filter(failure => failure.kind === "console:error");
+    expect(consoleFailures.map(failure => [failure.text, failure.consoleOrigin, failure.consoleOriginSource])).toEqual([
+      ["external script error", "https://app.example.test", "document-context"],
+      ["iframe error", "https://checkout.example.test", "document-context"],
+    ]);
+    const result = classifyLiveRun({
+      requiredAssertions: ["probe completes"],
+      assertions: [{ name: "probe completes", passed: true }],
+      failures: consoleFailures,
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://app.example.test"],
+    });
+    expect(result.blockingFailures).toEqual([consoleFailures[0]]);
+    expect(result.thirdPartyDiagnostics).toEqual([consoleFailures[1]]);
+  });
+
+  it("keeps console origin unknown and blocking when the event context is unavailable", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: failure => failures.push(failure),
+    });
+    page.emit("console", {
+      type: () => "error",
+      text: () => "context disappeared",
+      location: () => ({ url: "https://cdn.example.test/sdk.js" }),
+      args: () => [{ evaluate: async () => { throw new Error("execution context was destroyed"); } }],
+    });
+    await drainPending(pending);
+
+    expect(observations[0]).toMatchObject({
+      kind: "console",
+      consoleOriginSource: "unknown",
+      consoleAttributionError: { message: "execution context was destroyed" },
+    });
+    expect(failures.map(failure => failure.kind)).toEqual(["diagnostic-collection", "console:error"]);
+    const result = classifyLiveRun({
+      requiredAssertions: ["probe completes"],
+      assertions: [{ name: "probe completes", passed: true }],
+      failures,
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://app.example.test"],
+    });
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.thirdPartyDiagnostics).toEqual([]);
+  });
+
   it("requires the exact blob source for every observed blob response", () => {
     const response = { kind: "http", responseId: { source: "playwright", requestId: "blob-response-1" }, method: "GET", url: "blob:private", status: 200,
       body: { captureSource: "blob-source", blobId: "exact-source" } };

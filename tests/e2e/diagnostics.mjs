@@ -316,6 +316,93 @@ export async function configurePageCapture(
   };
 }
 
+export async function installSubscribeResponseCapture(
+  page,
+  { apiOrigin, addFailure, pending = [] } = {},
+) {
+  const expectedOrigin = new URL(apiOrigin).origin;
+  const responseBodies = new WeakMap();
+  const matches = url => {
+    try {
+      return url.origin === expectedOrigin && url.pathname === "/account/subscribe";
+    } catch {
+      return false;
+    }
+  };
+  const handler = async route => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+
+    let resolveCapture;
+    const capturePromise = new Promise(resolve => { resolveCapture = resolve; });
+    responseBodies.set(request, capturePromise);
+    const captureTask = (async () => {
+      let upstream;
+      try {
+        upstream = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: 30000 });
+        const capture = {
+          ok: true,
+          status: upstream.status(),
+          headers: upstream.headers(),
+          bytes: await upstream.body(),
+        };
+        await route.fulfill({ response: upstream });
+        resolveCapture(capture);
+      } catch (error) {
+        resolveCapture({ ok: false, error });
+        addFailure({
+          kind: "diagnostic-collection",
+          operation: "subscription response route",
+          method: request.method(),
+          url: safeUrl(request.url()),
+          error: safeError(error),
+        });
+        try {
+          await route.abort();
+        } catch (abortError) {
+          addFailure({
+            kind: "diagnostic-collection",
+            operation: "abort failed subscription response route",
+            method: request.method(),
+            url: safeUrl(request.url()),
+            error: safeError(abortError),
+          });
+        }
+      } finally {
+        if (upstream) {
+          try {
+            await upstream.dispose();
+          } catch (error) {
+            addFailure({
+              kind: "diagnostic-collection",
+              operation: "release subscription response route",
+              method: request.method(),
+              url: safeUrl(request.url()),
+              error: safeError(error),
+            });
+          }
+        }
+      }
+    })();
+    pending.push(captureTask);
+    await captureTask;
+  };
+  const routeMatcher = url => matches(url);
+  await page.route(routeMatcher, handler);
+  let installed = true;
+  return {
+    responseBodies,
+    remove: async () => {
+      if (!installed) return;
+      installed = false;
+      await page.unroute(routeMatcher, handler);
+    },
+  };
+}
+
 export async function drainBeforeClose(pending) {
   let timer;
   try {
@@ -436,7 +523,7 @@ export function missingResponseBodies(observations) {
       captureSource: "blob-source",
     }));
   const incompleteResponses = observations
-    .filter(item => item.kind === "http" && item.captureSource === "playwright")
+    .filter(item => item.kind === "http" && ["playwright", "playwright-route-fetch"].includes(item.captureSource))
     .filter(item => item.bodyCaptureComplete !== true && !["bodyless", "referenced"].includes(item.bodyCaptureStatus))
     .map(item => ({
       responseId: item.responseId,
@@ -444,7 +531,7 @@ export function missingResponseBodies(observations) {
       method: item.method,
       url: item.url,
       status: item.status,
-      captureSource: "playwright",
+      captureSource: item.captureSource,
       body: item.body,
     }));
   const mockResponseKey = item => JSON.stringify([item.method, item.url, item.status]);
@@ -612,15 +699,29 @@ export function classifyLiveRun({
       continue;
     }
     if (kind === "diagnostic-collection" || kind === "diagnostic-drain") captureIncomplete = true;
-    const sourceUrl = kind?.startsWith("console:")
-      ? failure.location?.url
-      : failure.url ?? failure.context?.url ?? failure.response?.url;
     let sourceOrigin;
-    if (typeof sourceUrl === "string") {
-      try {
-        sourceOrigin = new URL(sourceUrl).origin;
-      } catch {
-        sourceOrigin = undefined;
+    if (kind?.startsWith("console:")) {
+      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url") {
+        try {
+          sourceOrigin = new URL(failure.consoleOrigin).origin;
+        } catch {
+          sourceOrigin = undefined;
+        }
+      } else if (failure.consoleOriginSource !== "unknown" && typeof failure.location?.url === "string") {
+        try {
+          sourceOrigin = new URL(failure.location.url).origin;
+        } catch {
+          sourceOrigin = undefined;
+        }
+      }
+    } else {
+      const sourceUrl = failure.url ?? failure.context?.url ?? failure.response?.url;
+      if (typeof sourceUrl === "string") {
+        try {
+          sourceOrigin = new URL(sourceUrl).origin;
+        } catch {
+          sourceOrigin = undefined;
+        }
       }
     }
     if (sourceOrigin && !origins.has(sourceOrigin)) {
@@ -750,12 +851,10 @@ async function captureResponse(response, options) {
     status: response.status(),
     ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
   };
-  const responseHeadersTask = collect(
-    "response headers",
-    () => readHeaders(response),
-    context,
-    options.addFailure
-  );
+  const routedBodyPromise = options.responseBodies?.get(request);
+  const responseHeadersTask = routedBodyPromise
+    ? routedBodyPromise.then(capture => capture.ok ? capture.headers : {})
+    : collect("response headers", () => readHeaders(response), context, options.addFailure);
   const redirectResponse = context.status >= 300 && context.status <= 399;
   const bodylessResponse = request.method() === "HEAD" || [204, 304].includes(context.status) || redirectResponse;
   const bodylessReason = redirectResponse
@@ -765,14 +864,34 @@ async function captureResponse(response, options) {
     ? Promise.resolve({ captureSource: "blob-source", blobId: createHash("sha256").update(response.url()).digest("hex") })
     : bodylessResponse
     ? Promise.resolve({ unavailable: true, reason: bodylessReason })
+    : routedBodyPromise
+    ? routedBodyPromise.then(capture => {
+        if (!capture.ok) return { captureError: capture.error, captureSource: "playwright-route-fetch" };
+        if (capture.status !== context.status) {
+          const error = new Error("Routed subscription response status did not match the browser response.");
+          options.addFailure({
+            kind: "diagnostic-collection",
+            operation: "verify routed subscription response",
+            ...context,
+            error: safeError(error),
+          });
+          return { captureError: error, captureSource: "playwright-route-fetch" };
+        }
+        return { bytes: capture.bytes, captureSource: "playwright-route-fetch" };
+      })
     : collect(
         "response body",
         () => (typeof response.body === "function" ? response.body() : response.text()),
         context,
         options.addFailure
       );
-  const [responseHeaders, responseBody] = await Promise.all([responseHeadersTask, responseBodyTask]);
-  const serialized = await serializeResponseBody(responseBody, responseHeaders, context, options);
+  const [responseHeaders, responseBodyResult] = await Promise.all([responseHeadersTask, responseBodyTask]);
+  const responseBody = responseBodyResult?.captureError
+    ? undefined
+    : responseBodyResult?.bytes ?? responseBodyResult;
+  const serialized = responseBodyResult?.captureError
+    ? { body: { collection_error: [safeError(responseBodyResult.captureError)] }, bodyCaptured: false }
+    : await serializeResponseBody(responseBody, responseHeaders, context, options);
   const requestHeaders = await collect(
     "request headers",
     () => readHeaders(request),
@@ -792,6 +911,7 @@ async function captureResponse(response, options) {
     : serialized.bodyCaptured
     ? "complete"
     : "incomplete";
+  const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
   const item = {
     responseId,
     ...(frameId ? { frameId } : {}),
@@ -805,7 +925,7 @@ async function captureResponse(response, options) {
     body: serialized.body,
     bodyCaptureComplete: bodylessResponse || serialized.bodyCaptured,
     bodyCaptureStatus,
-    captureSource: "playwright",
+    captureSource,
     ...(context.fromServiceWorker !== undefined ? { fromServiceWorker: context.fromServiceWorker } : {}),
   };
   options.record("http", item);
@@ -822,12 +942,72 @@ async function captureResponse(response, options) {
 }
 
 async function captureConsole(message, options) {
+  const location = safeBody(message.location());
   const item = {
     type: message.type(),
     text: safeText(message.text()),
-    location: safeBody(message.location()),
+    location,
     argumentSource: "console-call",
   };
+  if (item.type === "error") {
+    let args;
+    try {
+      args = message.args();
+    } catch (error) {
+      item.consoleOriginSource = "unknown";
+      item.consoleAttributionError = safeError(error);
+      options.addFailure({
+        kind: "diagnostic-collection",
+        operation: "console document origin",
+        ...item,
+        error: safeError(error),
+      });
+    }
+    if (Array.isArray(args) && args.length > 0 && typeof args[0]?.evaluate === "function") {
+      try {
+        const origin = await args[0].evaluate(() => {
+          try {
+            const origin = new URL(globalThis.location.href).origin;
+            return origin === "null" ? undefined : origin;
+          } catch {
+            return undefined;
+          }
+        });
+        if (typeof origin === "string" && /^https?:\/\//i.test(origin)) {
+          item.consoleOrigin = new URL(origin).origin;
+          item.consoleOriginSource = "document-context";
+        } else {
+          item.consoleOriginSource = "unknown";
+        }
+      } catch (error) {
+        item.consoleOriginSource = "unknown";
+        item.consoleAttributionError = safeError(error);
+        options.addFailure({
+          kind: "diagnostic-collection",
+          operation: "console document origin",
+          ...item,
+          error: safeError(error),
+        });
+      }
+    } else if (args === undefined && item.consoleOriginSource === "unknown") {
+      // Reading the arguments itself failed; a URL fallback would hide that loss of attribution.
+    } else {
+      try {
+        const resourceUrl = location?.url;
+        const origin = typeof resourceUrl === "string" ? new URL(resourceUrl).origin : undefined;
+        if (origin && ["http:", "https:"].includes(new URL(resourceUrl).protocol)) {
+          item.consoleOrigin = origin;
+          item.consoleOriginSource = "resource-url";
+        } else {
+          item.consoleOriginSource = "unknown";
+        }
+      } catch {
+        item.consoleOriginSource = "unknown";
+      }
+    }
+  } else {
+    item.consoleOriginSource = "not-required";
+  }
   options.record("console", item);
   if (message.type() === "error" || message.type() === "warning") {
     options.addFailure({ kind: `console:${message.type()}`, ...item });
@@ -879,7 +1059,7 @@ async function captureRequestFailure(request, options) {
 
 export function installPageDiagnostics(
   page,
-  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin } = {}
+  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin, responseBodies } = {}
 ) {
   let diagnosticOrder = 0;
   const recordEvent = (kind, item) => record(kind, { ...item, diagnosticOrder: ++diagnosticOrder });
@@ -895,6 +1075,7 @@ export function installPageDiagnostics(
     addFailure: addDiagnosticFailure,
     binaryArtifactDir,
     mockResponseBodiesOrigin,
+    responseBodies,
     nextBinaryArtifact: () => ++binarySequence,
     responseIdFor(request) {
       let requestId = requestIds.get(request);
