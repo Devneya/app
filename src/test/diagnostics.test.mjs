@@ -6,11 +6,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   configurePageCapture,
+  closeCapturedPage,
   drainPending,
   drainBeforeClose,
   installPageDiagnostics,
-  missingCdpStreamResponses,
-  missingMockResponses,
+  captureMockResponse,
+  missingResponseBodies,
+  classifyLiveRun,
+  isAcceptedCaptureFailure,
+  isConsoleCopyOfExpectedHttpFailure,
   safeBody,
   safeError,
   safeText,
@@ -46,20 +50,383 @@ function fakeRequest(overrides = {}) {
 
 describe("browser diagnostics", () => {
   it("requires the exact blob source for every observed blob response", () => {
-    const response = { kind: "http", method: "GET", url: "blob:private", status: 200,
+    const response = { kind: "http", responseId: { source: "playwright", requestId: "blob-response-1" }, method: "GET", url: "blob:private", status: 200,
       body: { captureSource: "blob-source", blobId: "exact-source" } };
     const source = { kind: "blob-source", blobId: "exact-source", body: "complete source" };
-    expect(missingCdpStreamResponses([response])).toHaveLength(1);
-    expect(missingCdpStreamResponses([response, { ...source, blobId: "different-source" }])).toHaveLength(1);
-    expect(missingCdpStreamResponses([response, response, source])).toEqual([]);
+    expect(missingResponseBodies([response])).toMatchObject([{ responseId: response.responseId, captureSource: "blob-source" }]);
+    expect(missingResponseBodies([response, { ...source, blobId: "different-source" }])).toHaveLength(1);
+    expect(missingResponseBodies([response, {
+      ...response,
+      responseId: { source: "playwright", requestId: "blob-response-2" },
+      body: { captureSource: "blob-source", blobId: "other-source" },
+    }, source])).toMatchObject([{ responseId: { requestId: "blob-response-2" } }]);
+    expect(missingResponseBodies([response, response, source])).toEqual([]);
   });
-  it("detects missing original mock bodies and unmatched or duplicate source records", () => {
-    const response = { kind: "http", method: "GET", url: "https://example.test/account", status: 200, body: { captureSource: "msw-response:mocked" } };
-    const body = { ...response, body: "complete", captureSource: "msw-response:mocked" };
-    expect(missingMockResponses([response, body])).toEqual([]);
-    expect(missingMockResponses([response])).toMatchObject([{ observedResponses: 1, capturedBodies: 0 }]);
-    expect(missingMockResponses([body])).toMatchObject([{ observedResponses: 0, capturedBodies: 1 }]);
-    expect(missingMockResponses([response, response, body])).toMatchObject([{ observedResponses: 2, capturedBodies: 1 }]);
+  it("flags each incomplete Playwright response by its own ID, even when tuples match", () => {
+    const complete = {
+      kind: "http",
+      responseId: { source: "playwright", requestId: "request-a" },
+      method: "POST",
+      url: "https://checkout.example.test/calculate",
+      status: 403,
+      captureSource: "playwright",
+      bodyCaptureComplete: true,
+      body: { code: "CHECKOUT_SESSION_CONSUMED" },
+    };
+    const incomplete = {
+      ...complete,
+      responseId: { source: "playwright", requestId: "request-b" },
+      bodyCaptureComplete: false,
+      body: { collection_error: ["body unavailable"] },
+    };
+    expect(missingResponseBodies([complete, incomplete])).toEqual([expect.objectContaining({
+      responseId: incomplete.responseId,
+      captureSource: "playwright",
+    })]);
+    expect(missingResponseBodies([incomplete, complete])).toHaveLength(1);
+  });
+  it("reconciles delegated MSW responses with captured bodies without merging identical requests", () => {
+    const tuple = { method: "POST", url: "https://api.example.test/auth/token", status: 403 };
+    const delegated = id => ({
+      kind: "mock-response-delegated",
+      responseId: { source: "playwright", requestId: id },
+      ...tuple,
+    });
+    const captured = id => ({
+      kind: "http",
+      responseId: { source: "msw", requestId: id },
+      ...tuple,
+      captureSource: "msw-response:mocked",
+      bodyCaptureComplete: true,
+      body: { code: "denied" },
+    });
+    const twoDelegated = [delegated("playwright-a"), delegated("playwright-b")];
+    expect(missingResponseBodies([...twoDelegated, captured("msw-a")])).toEqual([
+      expect.objectContaining({
+        responseId: { source: "playwright", requestId: "playwright-a" },
+        captureSource: "msw-response:mocked",
+      }),
+    ]);
+    expect(missingResponseBodies([...twoDelegated, captured("msw-a"), captured("msw-b")])).toEqual([]);
+    expect(missingResponseBodies([delegated("playwright-a"), captured("msw-a"), captured("msw-extra")])).toEqual([
+      expect.objectContaining({
+        responseId: { source: "msw", requestId: "msw-extra" },
+        captureSource: "msw-response:mocked-unmatched",
+      }),
+    ]);
+    expect(missingResponseBodies([
+      ...twoDelegated,
+      captured("msw-duplicate-id"),
+      captured("msw-duplicate-id"),
+    ])).toContainEqual(expect.objectContaining({
+      responseId: { source: "msw", requestId: "msw-duplicate-id" },
+      captureSource: "msw-response:mocked-duplicate",
+    }));
+  });
+  it("does not report explicitly bodyless redirects as missing response bodies", () => {
+    const redirect = {
+      kind: "http",
+      responseId: { source: "playwright", requestId: "request-redirect" },
+      method: "GET",
+      url: "https://example.test/redirect",
+      status: 302,
+      captureSource: "playwright",
+      bodyCaptureComplete: false,
+      bodyCaptureStatus: "bodyless",
+      body: { unavailable: true, reason: "Playwright does not expose response bodies for 3xx responses" },
+    };
+    expect(missingResponseBodies([redirect])).toEqual([]);
+  });
+  it("keeps same-tuple Playwright responses distinct and links each failure to its response", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+    });
+    for (const code of ["first-denial", "second-denial"]) {
+      const request = fakeRequest({
+        method: () => "POST",
+        url: () => "https://checkout.example.test/calculate",
+        allHeaders: async () => ({}),
+        postData: () => null,
+      });
+      page.emit("response", {
+        request: () => request,
+        url: request.url,
+        status: () => 403,
+        resourceType: () => "fetch",
+        allHeaders: async () => ({ "content-type": "application/json" }),
+        body: async () => Buffer.from(JSON.stringify({ code })),
+      });
+    }
+    await drainPending(pending);
+
+    const responses = observations.filter(item => item.kind === "http");
+    const httpFailures = failures.filter(item => item.kind === "http");
+    expect(responses).toHaveLength(2);
+    expect(responses[0].responseId).not.toEqual(responses[1].responseId);
+    expect(responses.map(item => item.body.code).sort()).toEqual(["first-denial", "second-denial"]);
+    expect(httpFailures.map(item => item.responseId).sort((a, b) => a.requestId.localeCompare(b.requestId)))
+      .toEqual(responses.map(item => item.responseId).sort((a, b) => a.requestId.localeCompare(b.requestId)));
+    expect(missingResponseBodies(observations)).toEqual([]);
+  });
+  it("marks a missing MSW response-body hook as incomplete capture", async () => {
+    const page = fakePage();
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: () => {},
+      addFailure: item => failures.push(item),
+    });
+
+    await page.emit("console", {
+      type: () => "error",
+      text: () => "MSW mocked response capture hook unavailable: request-1",
+      args: () => [],
+      location: () => ({ url: "" }),
+    });
+    await Promise.all(pending);
+
+    expect(failures).toContainEqual(expect.objectContaining({
+      kind: "diagnostic-collection",
+      operation: "MSW mocked response body hook",
+    }));
+  });
+  it("records failed requests separately from HTTP responses", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+    });
+    const request = fakeRequest({ failure: () => ({ errorText: "connection reset" }) });
+    page.emit("requestfailed", request);
+    await drainPending(pending);
+
+    expect(observations.map(item => item.kind)).toEqual(["requestfailed"]);
+    expect(failures).toMatchObject([{ kind: "requestfailed", responseId: { source: "playwright" } }]);
+  });
+  it("treats HEAD, 204, 304, and redirects as explicitly bodyless", async () => {
+    const page = fakePage();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+    });
+    for (const [method, status] of [["HEAD", 200], ["GET", 204], ["GET", 304], ["GET", 302]]) {
+      const request = fakeRequest({
+        method: () => method,
+        url: () => `https://api.example.test/bodyless/${method}-${status}`,
+        allHeaders: async () => ({}),
+        postData: () => null,
+      });
+      page.emit("response", {
+        request: () => request,
+        url: request.url,
+        status: () => status,
+        resourceType: () => "fetch",
+        allHeaders: async () => ({}),
+        body: async () => { throw new Error("bodyless response body was requested"); },
+      });
+    }
+    await drainPending(pending);
+
+    const responses = observations.filter(item => item.kind === "http");
+    expect(responses).toHaveLength(4);
+    expect(responses.every(item => item.bodyCaptureComplete && item.bodyCaptureStatus === "bodyless")).toBe(true);
+    expect(missingResponseBodies(observations)).toEqual([]);
+    expect(failures).toEqual([]);
+  });
+  it("keeps third-party errors visible without making a verified live workflow fail", () => {
+    const result = classifyLiveRun({
+      requiredAssertions: ["checkout activates subscription"],
+      assertions: [{ name: "checkout activates subscription", passed: true }],
+      failures: [
+        { kind: "http", url: "https://checkout.example.test/calculate", status: 403 },
+        { kind: "console:error", location: { url: "https://checkout.example.test/sdk.js" } },
+        { kind: "diagnostic-collection", operation: "response body", url: "https://checkout.example.test/calculate" },
+      ],
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://app.example.test", "https://api.example.test"],
+    });
+
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.cleanupStatus).toBe("verified");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.thirdPartyDiagnostics).toHaveLength(3);
+    expect(result.blockingFailures).toEqual([]);
+  });
+  it("allows a console copy only when the exact expected HTTP failure is also recorded", () => {
+    const url = "https://api.example.test/auth/logout?scope=local";
+    const responseFailure = { kind: "http", method: "POST", status: 403, url };
+    const consoleFailure = {
+      kind: "console:error",
+      text: "Failed to load resource: the server responded with a status of 403 ()",
+      location: { url },
+    };
+    const failures = [responseFailure, consoleFailure];
+    const expectedHttpFailure = failure => failure.kind === "http" && failure.method === "POST" &&
+      failure.status === 403 && failure.url.endsWith("/auth/logout?scope=local");
+    expect(isConsoleCopyOfExpectedHttpFailure(consoleFailure, failures, expectedHttpFailure)).toBe(true);
+    expect(isConsoleCopyOfExpectedHttpFailure({ ...consoleFailure, location: { url: "" } }, failures, expectedHttpFailure)).toBe(false);
+    expect(isConsoleCopyOfExpectedHttpFailure({ ...consoleFailure, location: { url: "https://api.example.test/auth/token" } }, failures, expectedHttpFailure)).toBe(false);
+    expect(isConsoleCopyOfExpectedHttpFailure({ ...consoleFailure, text: "Failed to load resource: 403" }, failures, expectedHttpFailure)).toBe(false);
+    const result = classifyLiveRun({
+      requiredAssertions: ["browser account deletion completes"],
+      assertions: [{ name: "browser account deletion completes", passed: true }],
+      failures,
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://api.example.test"],
+      expectedHttpFailure,
+      expectedConsoleFailure: isConsoleCopyOfExpectedHttpFailure,
+    });
+
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.expectedHttpFailures).toHaveLength(1);
+    expect(result.expectedConsoleFailures).toEqual([consoleFailure]);
+  });
+  it("blocks first-party and unknown-source failures", () => {
+    const result = classifyLiveRun({
+      requiredAssertions: ["checkout activates subscription"],
+      assertions: [{ name: "checkout activates subscription", passed: true }],
+      failures: [
+        { kind: "requestfailed", url: "https://api.example.test/account" },
+        { kind: "diagnostic-collection", operation: "capture response body" },
+      ],
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://app.example.test", "https://api.example.test"],
+    });
+
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toHaveLength(2);
+  });
+  it("requires each named workflow assertion and verified cleanup", () => {
+    const result = classifyLiveRun({
+      requiredAssertions: ["login succeeds", "checkout activates subscription"],
+      assertions: [
+        { name: "login succeeds", passed: true },
+        { name: "checkout activates subscription", passed: false },
+      ],
+      failures: [],
+      cleanupStatus: "failed",
+      firstPartyOrigins: [],
+      evidenceWriteFailed: true,
+    });
+
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.missingAssertions).toEqual(["checkout activates subscription"]);
+    expect(result.failedAssertions).toHaveLength(1);
+    expect(result.blockingFailures.map(failure => failure.kind)).toContain("cleanup");
+    expect(result.blockingFailures.map(failure => failure.kind)).toContain("evidence-write");
+  });
+  it("accepts only a renderer disappearance paired to the exact response ID", () => {
+    const responseId = { source: "playwright", requestId: "playwright-request-7" };
+    const frameId = "playwright-frame-2";
+    const readFailure = {
+      kind: "diagnostic-collection",
+      operation: "response body",
+      responseId,
+      frameId,
+      at: "2026-09-13T12:00:00.200Z",
+      diagnosticOrder: 3,
+      error: { message: "Protocol error (Network.getResponseBody): No data found for resource with given identifier" },
+    };
+    const verificationFailure = {
+      kind: "diagnostic-collection",
+      operation: "verify complete response body capture",
+      responseId,
+      frameId,
+    };
+    const requestFailure = {
+      kind: "requestfailed",
+      responseId,
+      frameId,
+      diagnosticOrder: 4,
+      error: "net::ERR_ABORTED",
+    };
+    const observations = [{ kind: "frame-detached", frameId, at: "2026-09-13T12:00:00.200Z", diagnosticOrder: 2 }];
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, requestFailure])).toBe(false);
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, requestFailure], observations)).toBe(true);
+    expect(isAcceptedCaptureFailure(verificationFailure, [readFailure, verificationFailure, requestFailure], observations)).toBe(true);
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, {
+      ...requestFailure,
+      responseId: { source: "playwright", requestId: "playwright-request-8" },
+    }], observations)).toBe(false);
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, {
+      ...requestFailure,
+      frameId: "playwright-frame-other",
+    }], observations)).toBe(false);
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, requestFailure], [
+      { kind: "frame-detached", frameId, at: "2026-09-13T12:00:00.200Z", diagnosticOrder: 4 },
+    ])).toBe(false);
+    expect(isAcceptedCaptureFailure(readFailure, [readFailure, requestFailure], [
+      { kind: "frame-detached", frameId, at: "2026-09-13T12:00:00.200Z" },
+    ])).toBe(false);
+    const targetClosedFailure = {
+      ...readFailure,
+      error: { message: "Target page, context or browser has been closed" },
+    };
+    expect(isAcceptedCaptureFailure(targetClosedFailure, [targetClosedFailure, requestFailure], observations)).toBe(false);
+
+    const result = classifyLiveRun({
+      requiredAssertions: ["checkout activates subscription"],
+      assertions: [{ name: "checkout activates subscription", passed: true }],
+      observations,
+      failures: [
+        { kind: "console:warning", location: { url: "https://checkout.example.test/sdk.js" } },
+        readFailure,
+        verificationFailure,
+        { ...requestFailure, url: "https://checkout.example.test/calculate" },
+        { kind: "http", url: "https://api.example.test/auth/logout", status: 403 },
+      ],
+      cleanupStatus: "verified",
+      firstPartyOrigins: ["https://api.example.test"],
+      acceptedCaptureFailure: isAcceptedCaptureFailure,
+      expectedHttpFailure: failure => failure.url.endsWith("/auth/logout"),
+    });
+
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.acceptedCaptureFailures).toHaveLength(2);
+    expect(result.expectedHttpFailures).toHaveLength(1);
+    expect(result.warnings).toHaveLength(1);
+  });
+  it("keeps mocked responses and body-capture failures attached to their MSW request IDs", () => {
+    const observations = [];
+    const failures = [];
+    const callbacks = {
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+    };
+    const tuple = { method: "POST", url: "https://api.example.test/auth/token", status: 403 };
+    captureMockResponse({ kind: "response", requestId: "msw-request-1", ...tuple, body: '{"code":"denied"}' }, callbacks);
+    captureMockResponse({ kind: "error", requestId: "msw-request-2", ...tuple, error: { message: "body read failed" } }, callbacks);
+
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      kind: "http",
+      responseId: { source: "msw", requestId: "msw-request-1" },
+      body: { code: "denied" },
+      bodyCaptureComplete: true,
+    });
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      kind: "diagnostic-collection",
+      responseId: { source: "msw", requestId: "msw-request-2" },
+      operation: "MSW mocked response",
+    });
   });
   it("retains ordinary values and shared references while redacting named credentials", () => {
     const shared = { value: "complete output", card_last_four: "4242" };
@@ -113,6 +480,57 @@ describe("browser diagnostics", () => {
       vi.useRealTimers();
     }
   });
+  it("finishes pending Playwright body reads before closing the page", async () => {
+    let finishBody;
+    let pageClosed = false;
+    const body = Buffer.from("{\"captured\":true}");
+    const pending = [];
+    const observations = [];
+    const failures = [];
+    const page = Object.assign(fakePage(), { close: async () => { pageClosed = true; } });
+    const removeDiagnostics = installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+    });
+    const request = fakeRequest({
+      method: () => "GET",
+      url: () => "https://api.example.test/pending-body",
+      allHeaders: async () => ({}),
+      postData: () => null,
+    });
+    page.emit("response", {
+      request: () => request,
+      url: request.url,
+      status: () => 200,
+      resourceType: () => "fetch",
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      body: () => new Promise(resolve => { finishBody = resolve; }),
+    });
+
+    const teardown = closeCapturedPage({ pending, removeDiagnostics, page });
+    await Promise.resolve();
+    expect(pageClosed).toBe(false);
+    finishBody(body);
+    await teardown;
+
+    expect(pageClosed).toBe(true);
+    expect(observations.find(item => item.kind === "http").body).toEqual({ captured: true });
+    expect(observations.find(item => item.kind === "http").bodyCaptureComplete).toBe(true);
+    expect(failures).toEqual([]);
+  });
+  it("reports a rejected capture task only once across teardown drain phases", async () => {
+    const pending = [Promise.resolve().then(() => { throw new Error("capture task failed"); })];
+    const teardown = await closeCapturedPage({
+      pending,
+      removeDiagnostics: () => {},
+      page: { close: async () => {} },
+    });
+
+    const rejected = teardown.drainResults.filter(result => result.status === "rejected");
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason.message).toBe("capture task failed");
+  });
   it("redacts credentials while retaining exception stacks", () => {
     const error = new Error("failed with https://api.stage.devneya.com?token=secret-token");
     error.cause = new Error("nested cause");
@@ -163,6 +581,19 @@ describe("browser diagnostics", () => {
       allHeaders: async () => ({ "set-cookie": "secret-cookie", "content-type": "application/json", "x-safe": "yes" }),
       text: async () => JSON.stringify({ access_token: "secret-token", success: true }),
     });
+    const deniedRequest = fakeRequest({
+      method: () => "POST",
+      url: () => "https://api.stage.devneya.com/auth/token",
+      allHeaders: async () => ({}),
+      postData: () => null,
+    });
+    await page.emit("response", {
+      request: () => deniedRequest,
+      url: deniedRequest.url,
+      status: () => 403,
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      text: async () => '{"code":"denied"}',
+    });
     for (const type of ["debug", "info", "log", "warning", "error"]) {
       await page.emit("console", {
         type: () => type,
@@ -211,6 +642,10 @@ describe("browser diagnostics", () => {
     expect(output).toContain("requestHeaders");
     expect(output).toContain("requestBody");
     expect(output).toContain("connection reset");
+    const deniedResponse = observations.find(item => item.kind === "http" && item.url.endsWith("/auth/token"));
+    const deniedFailure = failures.find(item => item.kind === "http" && item.url.endsWith("/auth/token"));
+    expect(deniedResponse.responseId).toEqual(deniedFailure.responseId);
+    expect(observations.filter(item => item.kind === "http" && item.url.endsWith("/auth/token"))).toHaveLength(1);
     expect(output).not.toContain("secret-token");
     expect(output).not.toContain("secret-cookie");
     expect(failures.map((item) => item.kind)).toContain("requestfailed");
@@ -337,187 +772,19 @@ describe("browser diagnostics", () => {
     expect(failures).toHaveLength(0);
   });
 
-  it("configures uncached CDP streams through one reusable setup", async () => {
-    const calls = [];
-    const listeners = new Map();
-    const session = {
-      send: async (...args) => {
-        calls.push(args);
-        if (args[0] === "Page.getFrameTree") return { frameTree: { frame: { id: "root" } } };
-        if (args[0] === "Network.streamResourceContent") return { bufferedData: "" };
-        return {};
-      },
-      on: (event, listener) => listeners.set(event, listener),
-      off: (event, listener) => { if (listeners.get(event) === listener) listeners.delete(event); },
-    };
+  it("configures page capture and installs the blob source hook", async () => {
+    const bindings = [];
+    const scripts = [];
     const page = {
-      context: () => ({ newCDPSession: async () => session }),
-      exposeBinding: async () => {},
-      addInitScript: async () => {},
+      exposeBinding: async (...args) => bindings.push(args),
+      addInitScript: async script => scripts.push(script),
     };
+    const configured = await configurePageCapture(page, { record: () => {}, addFailure: () => {} });
 
-    const capture = await configurePageCapture(page, { record: () => {}, addFailure: () => {} });
-    expect(calls).toEqual([
-      ["Page.getFrameTree"],
-      ["Network.enable"],
-      ["Network.setCacheDisabled", { cacheDisabled: true }],
-      ["Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: false,
-        filter: [{ type: "iframe" }, { type: "worker" }, { exclude: true }] }],
-    ]);
-    expect(capture.cdpBodyCapture).toBe("streamResourceContent");
-    capture.cdpStreams.close();
-  });
-
-  it("retains an invalid browser frame-tree result at the setup boundary", async () => {
-    const result = { unexpected: "complete provider output" };
-    const page = {
-      context: () => ({ newCDPSession: async () => ({ send: async () => result }) }),
-      exposeBinding: async () => {}, addInitScript: async () => {},
-    };
-    await expect(configurePageCapture(page, { record: () => {}, addFailure: () => {} }))
-      .rejects.toMatchObject({ message: "Page.getFrameTree returned no root frame ID", cause: result });
-  });
-
-  it("captures a main-frame body from request-time CDP streaming", async () => {
-    const page = fakePage();
-    const calls = [];
-    const listeners = new Map();
-    const payload = Buffer.from(JSON.stringify({ status: "streamed" }));
-    const session = {
-      send: async (...args) => {
-        calls.push(args);
-        if (args[0] === "Page.getFrameTree") return { frameTree: { frame: { id: "root" } } };
-        if (args[0] === "Network.streamResourceContent" && args[1].requestId === "request-3") {
-          throw new Error("Request with the provided ID has already finished loading");
-        }
-        if (args[0] === "Network.getResponseBody" && args[1].requestId === "request-3") {
-          return { body: JSON.stringify({ fallback: "complete" }), base64Encoded: false };
-        }
-        if (args[0] === "Network.streamResourceContent") return { bufferedData: payload.toString("base64") };
-        return {};
-      },
-      on: (event, listener) => listeners.set(event, listener),
-      off: (event, listener) => { if (listeners.get(event) === listener) listeners.delete(event); },
-      emit: (event, value) => listeners.get(event)?.(value),
-    };
-    page.context = () => ({ newCDPSession: async () => session });
-    page.exposeBinding = async () => {};
-    page.addInitScript = async () => {};
-    const observations = [];
-    const failures = [];
-    const pending = [];
-    const capture = await configurePageCapture(page, {
-      pending,
-      record: (kind, value) => observations.push({ kind, ...value }),
-      addFailure: failure => failures.push(failure),
-    });
-    installPageDiagnostics(page, {
-      pending,
-      cdpStreams: capture.cdpStreams,
-      record: (kind, value) => observations.push({ kind, ...value }),
-      addFailure: failure => failures.push(failure),
-    });
-    session.emit("Network.requestWillBeSent", {
-      requestId: "request-1",
-      frameId: "root",
-      request: { url: "https://api.example.test/account", method: "GET" },
-    });
-    session.emit("Network.responseReceived", {
-      requestId: "request-1",
-      response: { url: "https://api.example.test/account", status: 200, headers: { "content-type": "application/json" } },
-    });
-    session.emit("Network.loadingFinished", { requestId: "request-1", encodedDataLength: payload.length });
-    const request = fakeRequest({
-      method: () => "GET",
-      url: () => "https://api.example.test/account",
-      allHeaders: async () => ({}),
-      postData: () => null,
-    });
-    await page.emit("response", {
-      request: () => request,
-      url: request.url,
-      status: () => 200,
-      resourceType: () => "fetch",
-      frame: () => ({ parentFrame: () => null }),
-      allHeaders: async () => ({ "content-type": "application/json" }),
-      body: async () => { throw new Error("delayed Playwright body was used"); },
-    });
-    await drainPending(pending);
-    const record = observations.find(item => item.kind === "http" && item.captureSource === "cdp-stream");
-    expect(record.body).toEqual({ status: "streamed" });
-    expect(record.captureSource).toBe("cdp-stream");
-    expect(record.streamComplete).toBe(true);
-    expect(observations.find(item => item.kind === "http" && item.body?.captureSource === "cdp-stream")).toBeTruthy();
-    expect(missingCdpStreamResponses(observations)).toEqual([]);
-    expect(failures).toEqual([]);
-    expect(calls.some(([name]) => name === "Network.configureDurableMessages")).toBe(false);
-    session.emit("Network.requestWillBeSent", {
-      requestId: "request-2",
-      frameId: "root",
-      request: { url: "https://api.example.test/partial", method: "GET" },
-    });
-    session.emit("Network.responseReceived", {
-      requestId: "request-2",
-      response: { url: "https://api.example.test/partial", status: 200, headers: { "content-type": "application/json" } },
-    });
-    session.emit("Network.dataReceived", { requestId: "request-2", data: Buffer.from("partial").toString("base64") });
-    session.emit("Network.loadingFailed", { requestId: "request-2", errorText: "local stream failure", canceled: false });
-    const partialRequest = fakeRequest({
-      method: () => "GET",
-      url: () => "https://api.example.test/partial",
-      allHeaders: async () => ({}),
-      postData: () => null,
-    });
-    await page.emit("response", {
-      request: () => partialRequest,
-      url: partialRequest.url,
-      status: () => 200,
-      resourceType: () => "fetch",
-      frame: () => ({ parentFrame: () => null }),
-      allHeaders: async () => ({ "content-type": "application/json" }),
-      body: async () => { throw new Error("delayed Playwright body was used"); },
-    });
-    await drainPending(pending);
-    const partial = observations.find(item => item.kind === "http" && item.url.endsWith("/partial") && item.captureSource === "cdp-stream");
-    expect(partial.streamComplete).toBe(false);
-    expect(partial.bodyCaptureComplete).toBe(false);
-    expect(partial.availableBodyCaptureComplete).toBe(true);
-    expect(partial.cdpStream.errors[0].message).toContain("local stream failure");
-    expect(failures.some(item => item.operation === "CDP response loading")).toBe(true);
-    session.emit("Network.requestWillBeSent", {
-      requestId: "request-3",
-      frameId: "root",
-      request: { url: "https://api.example.test/fallback", method: "GET" },
-    });
-    session.emit("Network.responseReceived", {
-      requestId: "request-3",
-      response: { url: "https://api.example.test/fallback", status: 200, headers: { "content-type": "application/json" } },
-    });
-    session.emit("Network.loadingFinished", { requestId: "request-3", encodedDataLength: 22 });
-    const fallbackRequest = fakeRequest({
-      method: () => "GET",
-      url: () => "https://api.example.test/fallback",
-      allHeaders: async () => ({}),
-      postData: () => null,
-    });
-    await page.emit("response", {
-      request: () => fallbackRequest,
-      url: fallbackRequest.url,
-      status: () => 200,
-      resourceType: () => "fetch",
-      frame: () => ({ parentFrame: () => null }),
-      allHeaders: async () => ({ "content-type": "application/json" }),
-      body: async () => { throw new Error("delayed Playwright body was used"); },
-    });
-    await drainPending(pending);
-    const fallback = observations.find(item => item.kind === "http" && item.url.endsWith("/fallback") && item.captureSource === "cdp-stream");
-    expect(fallback.body).toEqual({ fallback: "complete" });
-    expect(fallback.streamComplete).toBe(false);
-    expect(fallback.bodyCaptureComplete).toBe(true);
-    expect(fallback.bodyCaptureMethod).toBe("Network.getResponseBody");
-    expect(fallback.cdpStream.errors[0].message).toContain("already finished loading");
-    expect(missingCdpStreamResponses(observations)).toEqual([]);
-    capture.cdpStreams.close();
+    expect(bindings.some(([name]) => name === "__devneyaCaptureBlob")).toBe(true);
+    expect(scripts).toHaveLength(2);
+    expect(configured.responseBodyCapture).toContain("Playwright response bodies");
+    expect(Object.keys(configured)).toEqual(["responseBodyCapture"]);
   });
 
   it("stores binary response bytes privately instead of decoding them as text", async () => {
@@ -574,21 +841,48 @@ describe("browser diagnostics", () => {
     expect(failures).toEqual([]);
   });
 
-  it("uses the original mock body source only within its configured origin", async () => {
+  it("lets the MSW event own mocked response bodies", async () => {
     const page = fakePage();
     const records = [];
     const failures = [];
     const pending = [];
-    installPageDiagnostics(page, { pending, mockResponseBodiesOrigin: "https://api.stage.devneya.com", record: (kind, data) => records.push({ kind, ...data }), addFailure: failure => failures.push(failure) });
+    installPageDiagnostics(page, {
+      pending,
+      mockResponseBodiesOrigin: "https://api.stage.devneya.com",
+      record: (kind, data) => records.push({ kind, ...data }),
+      addFailure: failure => failures.push(failure),
+    });
     const request = fakeRequest();
     const text = vi.fn(async () => "complete passthrough body");
-    for (const url of [request.url(), "https://fonts.example.test/style.css"]) {
-      page.emit("response", { request: () => request, url: () => url, status: () => 200, fromServiceWorker: () => true, allHeaders: async () => ({}), text });
-    }
+    page.emit("response", { request: () => request, url: request.url, status: () => 200, fromServiceWorker: () => true, allHeaders: async () => ({}), text });
     await drainPending(pending);
-    expect(records.find(record => record.url.startsWith("https://api.stage"))?.body).toEqual({ captureSource: "msw-response:mocked" });
-    expect(records.find(record => record.url.startsWith("https://fonts"))?.body).toBe("complete passthrough body");
-    expect(text).toHaveBeenCalledTimes(1);
+    expect(text).not.toHaveBeenCalled();
+    expect(records).toMatchObject([{
+      kind: "mock-response-delegated",
+      responseId: { source: "playwright" },
+      method: "POST",
+      status: 200,
+    }]);
+    expect(JSON.stringify(records)).not.toContain("secret-token");
+    captureMockResponse({
+      kind: "response",
+      requestId: "msw-request-1",
+      method: "POST",
+      url: request.url(),
+      status: 200,
+      body: '{"result":"complete"}',
+    }, {
+      record: (kind, data) => records.push({ kind, ...data }),
+      addFailure: failure => failures.push(failure),
+    });
+    expect(records).toMatchObject([{
+      kind: "mock-response-delegated",
+    }, {
+      kind: "http",
+      responseId: { source: "msw", requestId: "msw-request-1" },
+      body: { result: "complete" },
+    }]);
+    expect(missingResponseBodies(records)).toEqual([]);
     expect(failures).toEqual([]);
   });
 

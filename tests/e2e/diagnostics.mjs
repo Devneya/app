@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { installConsoleCapture } from "./console-capture.mjs";
-import { captureChildSessions } from "./frame-sessions.mjs";
 import { installBlobCapture } from "./blob-capture.mjs";
 
 const SENSITIVE_KEY =
@@ -278,297 +277,14 @@ export async function drainPending(pending) {
   let drained = 0;
   while (drained < pending.length) {
     const batch = pending.slice(drained);
-    settled.push(...(await Promise.allSettled(batch)));
+    const start = drained;
+    settled.push(...(await Promise.allSettled(batch)).map((result, index) => ({
+      ...result,
+      taskIndex: start + index,
+    })));
     drained += batch.length;
   }
   return settled;
-}
-
-function responseIsMainFrame(response, addFailure) {
-  if (typeof response.frame !== "function") return undefined;
-  try {
-    const frame = response.frame();
-    return typeof frame?.parentFrame === "function" ? frame.parentFrame() === null : undefined;
-  } catch (error) {
-    addFailure({
-      kind: "diagnostic-collection",
-      operation: "response frame metadata",
-      error: safeError(error),
-    });
-    return undefined;
-  }
-}
-
-function createCdpStreamCapture(session, rootFrameId, { pending, record, addFailure, binaryArtifactDir, nextBinaryArtifact }) {
-  const entries = new Map();
-  const listeners = new Map();
-
-  const listen = (event, listener) => {
-    session.on(event, listener);
-    listeners.set(event, listener);
-  };
-
-  const retainEntryError = (entry, error) => {
-    entry.errors.push(error);
-  };
-
-  const addEntryFailure = (entry, error, operation = "CDP response stream") => {
-    retainEntryError(entry, error);
-    addFailure({
-      kind: "diagnostic-collection",
-      operation,
-      url: safeUrl(entry.response?.url ?? entry.url),
-      method: entry.method,
-      ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
-      error: safeError(error),
-    });
-  };
-
-  const finish = (entry, status) => {
-    if (entry.settled) return;
-    entry.settled = true;
-    entry.finished = status === "finished";
-    entry.loadingFailed = status === "failed";
-    entry.resolveDone();
-  };
-
-  const emitEntry = async entry => {
-    await entry.streamTask;
-    const bytes = entry.fallbackBody ?? Buffer.concat([entry.buffered, ...entry.chunks]);
-    const url = safeUrl(entry.response?.url ?? entry.url);
-    const context = {
-      url,
-      method: entry.method,
-      ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
-      ...(entry.response?.fromServiceWorker !== undefined
-        ? { fromServiceWorker: entry.response.fromServiceWorker }
-        : {}),
-    };
-    try {
-      const responseHeaders = entry.response?.headers ?? {};
-      const serialized = await serializeResponseBody(bytes, responseHeaders, context, {
-        binaryArtifactDir,
-        binaryPrefix: "cdp-response",
-        nextBinaryArtifact,
-        addFailure,
-      });
-      const request = {
-        postData: () => entry.postData ?? null,
-        postDataBuffer: () => entry.postData ?? null,
-      };
-      const requestData = await collect(
-        "request body",
-        () => requestBody(request, entry.requestHeaders ?? {}),
-        context,
-        addFailure,
-      );
-      const item = {
-        ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
-        method: entry.method,
-        resourceType: entry.resourceType ?? "unknown",
-        url,
-        requestHeaders: safeHeaders(entry.requestHeaders ?? {}),
-        headers: safeHeaders(responseHeaders),
-        requestBody: requestData,
-        body: entry.redirect ? { unavailable: true, reason: "Chromium does not expose redirect response bodies; the request ID is reused for the next hop", observedStreamBytes: serialized.body }
-          : !entry.bodyCaptureComplete && entry.errors.length && bytes.byteLength === 0
-          ? { collection_error: entry.errors.map(error => safeError(error)), partialByteLength: 0 }
-          : serialized.body,
-        mainFrame: entry.frameId === rootFrameId,
-        ...(context.fromServiceWorker !== undefined
-          ? { fromServiceWorker: context.fromServiceWorker }
-          : {}),
-        captureSource: "cdp-stream",
-        streamComplete: entry.finished && !entry.loadingFailed && entry.streamMethodSucceeded === true,
-        bodyCaptureComplete: entry.bodyCaptureComplete === true && !entry.loadingFailed,
-        availableBodyCaptureComplete: entry.bodyCaptureComplete === true && (entry.finished || entry.loadingError !== undefined),
-        bodyCaptureMethod: entry.bodyCaptureMethod,
-        cdpStream: {
-          requestId: entry.requestId,
-          frameId: entry.frameId,
-          bufferedBytes: entry.buffered.byteLength,
-          chunkCount: entry.chunks.length,
-          byteLength: bytes.byteLength,
-          ...(entry.response?.mimeType ? { mimeType: entry.response.mimeType } : {}),
-          ...(entry.encodedDataLength !== undefined ? { encodedDataLength: entry.encodedDataLength } : {}),
-          ...(entry.errors.length ? { errors: entry.errors.map(error => safeError(error)) } : {}),
-        },
-      };
-      record("http", item);
-    } catch (error) {
-      addFailure({
-        kind: "diagnostic-collection",
-        operation: "CDP response record",
-        ...context,
-        error: safeError(error),
-      });
-    }
-  };
-
-  const createEntry = (event) => {
-    let resolveDone;
-    const entry = {
-      requestId: event.requestId,
-      frameId: event.frameId,
-      url: event.request?.url ?? "",
-      method: event.request?.method ?? "GET",
-      resourceType: event.type,
-      requestHeaders: event.request?.headers ?? {},
-      postData: event.request?.postData,
-      chunks: [],
-      buffered: Buffer.alloc(0),
-      errors: [],
-      settled: false,
-      finished: false,
-      loadingFailed: false,
-      done: new Promise(resolve => { resolveDone = resolve; }),
-      resolveDone,
-    };
-    entries.set(entry.requestId, entry);
-    let streamCommand;
-    try {
-      streamCommand = session.send("Network.streamResourceContent", { requestId: entry.requestId });
-    } catch (error) {
-      streamCommand = Promise.reject(error);
-    }
-    entry.streamTask = Promise.resolve(streamCommand)
-      .then(result => {
-        if (typeof result?.bufferedData !== "string") {
-          const error = new Error("Network.streamResourceContent returned no bufferedData string");
-          error.cause = safeBody(result);
-          throw error;
-        }
-        entry.buffered = Buffer.from(result.bufferedData, "base64");
-        entry.streamMethodSucceeded = true;
-        entry.bodyCaptureComplete = true;
-        entry.bodyCaptureMethod = "Network.streamResourceContent";
-      })
-      .catch(async error => {
-        await entry.done;
-        if (entry.redirect || entry.method === "HEAD" || [204, 304].includes(entry.response?.status)) {
-          retainEntryError(entry, error);
-          entry.bodyCaptureComplete = !entry.redirect;
-          entry.bodyCaptureMethod = "HTTP bodyless response";
-          record("capture-method", { operation: "CDP response stream", requestId: entry.requestId,
-            url: safeUrl(entry.url), error: safeError(error), reason: entry.redirect ? "redirect body unavailable in Chromium" : "HTTP response has no body" });
-          return;
-        }
-        const alreadyFinished = /Request with the provided ID has already finished loading/i.test(error?.message ?? "");
-        if (!alreadyFinished) {
-          addEntryFailure(entry, error);
-          return;
-        }
-        retainEntryError(entry, error);
-        try {
-          const result = await session.send("Network.getResponseBody", { requestId: entry.requestId });
-          if (typeof result?.body !== "string" || typeof result?.base64Encoded !== "boolean") {
-            const keys = result && typeof result === "object" ? Object.keys(result).join(", ") : typeof result;
-            const error = new Error(`Network.getResponseBody returned no complete body result (keys: ${keys})`);
-            error.cause = safeBody(result);
-            throw error;
-          }
-          entry.fallbackBody = Buffer.from(result.body, result.base64Encoded ? "base64" : "utf8");
-          entry.bodyCaptureComplete = true;
-          entry.bodyCaptureMethod = "Network.getResponseBody";
-          record("capture-method", {
-            operation: "CDP response stream",
-            fallback: "Network.getResponseBody",
-            requestId: entry.requestId,
-            url: safeUrl(entry.url),
-            method: entry.method,
-            error: safeError(error),
-          });
-        } catch (fallbackError) {
-          addFailure({
-            kind: "diagnostic-collection",
-            operation: "CDP response stream",
-            url: safeUrl(entry.response?.url ?? entry.url),
-            method: entry.method,
-            ...(entry.response?.status !== undefined ? { status: entry.response.status } : {}),
-            error: safeError(error),
-          });
-          addEntryFailure(entry, fallbackError, "CDP completed-body fallback");
-        }
-      });
-    entry.emitTask = Promise.all([entry.streamTask, entry.done]).then(() => emitEntry(entry));
-    track(pending, "CDP response stream", entry.emitTask, { url: safeUrl(entry.url), method: entry.method }, addFailure);
-    return entry;
-  };
-
-  listen("Network.requestWillBeSent", event => {
-    // Blob bytes are captured at creation, not read from the network body store.
-    if (event.request?.url?.startsWith("blob:")) return;
-    // Cross-process navigation and initial scripts belong to Playwright's
-    // existing session; they can start before this session enables Network.
-    if (["Document", "Script"].includes(event.type) && event.frameId !== rootFrameId) return;
-    const previous = entries.get(event.requestId);
-    if (previous && !previous.settled) {
-      if (event.redirectResponse) {
-        previous.response = {
-          url: event.redirectResponse.url ?? previous.url,
-          status: event.redirectResponse.status,
-          headers: event.redirectResponse.headers ?? {},
-          mimeType: event.redirectResponse.mimeType,
-          fromServiceWorker: event.redirectResponse.fromServiceWorker,
-        };
-        previous.redirect = true;
-        finish(previous, "failed");
-      } else {
-        addEntryFailure(previous, new Error("CDP request identifier was reused before its stream finished"));
-        finish(previous, "failed");
-      }
-    }
-    createEntry(event);
-  });
-  listen("Network.responseReceived", event => {
-    const entry = entries.get(event.requestId);
-    if (!entry || entry.settled) return;
-    entry.response = {
-      url: event.response?.url ?? entry.url,
-      status: event.response?.status,
-      headers: event.response?.headers ?? {},
-      mimeType: event.response?.mimeType,
-      fromServiceWorker: event.response?.fromServiceWorker,
-    };
-    entry.resourceType = event.type ?? entry.resourceType;
-  });
-  listen("Network.dataReceived", event => {
-    const entry = entries.get(event.requestId);
-    if (!entry || entry.settled) return;
-    if (typeof event.data === "string") entry.chunks.push(Buffer.from(event.data, "base64"));
-  });
-  listen("Network.loadingFinished", event => {
-    const entry = entries.get(event.requestId);
-    if (!entry || entry.settled) return;
-    entry.encodedDataLength = event.encodedDataLength;
-    finish(entry, "finished");
-  });
-  listen("Network.loadingFailed", event => {
-    const entry = entries.get(event.requestId);
-    if (!entry || entry.settled) return;
-    const error = new Error(event.errorText || "Network loading failed");
-    if (event.canceled !== undefined) error.canceled = event.canceled;
-    entry.loadingError = error;
-    retainEntryError(entry, error);
-    addFailure({ kind: "requestfailed", operation: "CDP response loading",
-      requestId: entry.requestId, url: safeUrl(entry.url), method: entry.method, error: safeError(error) });
-    finish(entry, "failed");
-  });
-
-  const close = () => {
-    for (const [event, listener] of listeners) {
-      if (typeof session.off === "function") session.off(event, listener);
-      else session.removeListener(event, listener);
-    }
-    for (const entry of entries.values()) {
-      if (!entry.settled) {
-        addEntryFailure(entry, new Error("CDP response stream stopped before loading finished"), "CDP response stream teardown");
-        finish(entry, "failed");
-      }
-    }
-  };
-
-  return { close, entries };
 }
 
 export async function configurePageCapture(
@@ -595,47 +311,8 @@ export async function configurePageCapture(
     record("blob-source", { blobId: createHash("sha256").update(payload.url).digest("hex"),
       url: safeUrl(payload.url), contentType: payload.contentType, body: serialized.body });
   })(), { url: safeUrl(payload.url) }, addFailure));
-  const session = await page.context().newCDPSession(page);
-  const frameTree = await session.send("Page.getFrameTree");
-  const rootFrameId = frameTree?.frameTree?.frame?.id;
-  if (typeof rootFrameId !== "string" || !rootFrameId) {
-    throw new Error("Page.getFrameTree returned no root frame ID", { cause: safeBody(frameTree) });
-  }
-  await session.send("Network.enable");
-  await session.send("Network.setCacheDisabled", { cacheDisabled: true });
-  let binarySequence = 0;
-  const options = {
-    pending,
-    record,
-    addFailure,
-    binaryArtifactDir,
-    nextBinaryArtifact: () => ++binarySequence,
-  };
-  const cdpStreams = createCdpStreamCapture(session, rootFrameId, options);
-  const reportFailure = error => addFailure({
-    kind: "diagnostic-collection", operation: "child CDP session", error: safeError(error),
-  });
-  const configureChild = child => {
-    const streams = createCdpStreamCapture(child, rootFrameId, options);
-    let closeChildren = () => {};
-    track(pending, "configure child CDP capture", (async () => {
-      await child.send("Network.enable");
-      await child.send("Network.setCacheDisabled", { cacheDisabled: true });
-      closeChildren = await captureChildSessions(child, configureChild, reportFailure);
-    })(), {}, addFailure);
-    return () => { closeChildren(); streams.close(); };
-  };
-  const closeChildren = await captureChildSessions(session, configureChild, reportFailure);
-  const closeRoot = cdpStreams.close;
-  cdpStreams.close = () => { closeChildren(); closeRoot(); };
-
   return {
-    browserCache: "disabled",
-    cacheCoverage: "not-covered",
-    cdpBodyCapture: "streamResourceContent",
-    cdpBodyCoverage: "page/frame/worker streams; Playwright captures child network documents and scripts; blob bytes captured at creation",
-    rootFrameId,
-    cdpStreams,
+    responseBodyCapture: "Playwright response bodies; MSW owns mocked bodies; blob bytes captured at creation",
   };
 }
 
@@ -656,46 +333,331 @@ export async function drainBeforeClose(pending) {
   }
 }
 
-export const MOCK_RESPONSE_CAPTURE_HOOK = "__devneyaCaptureMockResponse";
+export async function closeCapturedPage({ pending = [], removeDiagnostics, page } = {}) {
+  const settledTasks = new Map();
+  const drainTimeouts = [];
+  const closeErrors = [];
+  const drain = async operation => {
+    try {
+      const results = await drainBeforeClose(pending);
+      for (const result of results) {
+        if (Number.isInteger(result.taskIndex)) settledTasks.set(result.taskIndex, result);
+        else drainTimeouts.push({ ...result, phase: operation });
+      }
+    } catch (error) {
+      closeErrors.push({ operation, error });
+    }
+  };
+  const attempt = async (operation, action) => {
+    try {
+      await action?.();
+    } catch (error) {
+      closeErrors.push({ operation, error });
+    }
+  };
 
-export function missingMockResponses(observations) {
-  const counts = new Map();
-  for (const item of observations) {
-    if (item.kind !== "http") continue;
-    const source = item.captureSource === "msw-response:mocked";
-    if (!source && item.body?.captureSource !== "msw-response:mocked") continue;
-    const key = JSON.stringify([item.method, item.url, item.status]);
-    const count = counts.get(key) ?? { response: [item.method, item.url, item.status], observedResponses: 0, capturedBodies: 0 };
-    count[source ? "capturedBodies" : "observedResponses"] += 1;
-    counts.set(key, count);
-  }
-  return [...counts.values()].filter(count => count.observedResponses !== count.capturedBodies);
+  await drain("drain before capture shutdown");
+  await attempt("remove page diagnostics listeners", removeDiagnostics);
+  await attempt("close page", () => page?.close());
+  await drain("drain after page close");
+  const drainResults = [...settledTasks.values(), ...drainTimeouts].map(result =>
+    Object.fromEntries(Object.entries(result).filter(([key]) => key !== "taskIndex"))
+  );
+  return { drainResults, closeErrors };
 }
 
-export function missingCdpStreamResponses(observations) {
-  const blobIds = new Set(observations.filter(item => item.kind === "blob-source").map(item => item.blobId));
-  const missingBlobs = observations.filter(item => item.kind === "http" && item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId));
-  const counts = new Map();
-  for (const item of observations) {
-    if (item.kind !== "http") continue;
-    if (item.status >= 300 && item.status <= 399) continue;
-    const source = item.captureSource === "cdp-stream";
-    const placeholder = item.body?.captureSource === "cdp-stream";
-    if (!source && !placeholder) continue;
-    const key = JSON.stringify([item.method, item.url, item.status]);
-    const count = counts.get(key) ?? {
-      response: [item.method, item.url, item.status],
-      observedResponses: 0,
-      capturedBodies: 0,
-    };
-    if (placeholder) count.observedResponses += 1;
-    if (source && (item.bodyCaptureComplete === true || item.availableBodyCaptureComplete === true)) count.capturedBodies += 1;
-    counts.set(key, count);
+export const MOCK_RESPONSE_CAPTURE_HOOK = "__devneyaCaptureMockResponse";
+
+export function captureMockResponse(payload, { record, addFailure }) {
+  const data = payload && typeof payload === "object"
+    ? payload
+    : {};
+  const responseId = typeof data.requestId === "string"
+    ? { source: "msw", requestId: data.requestId }
+    : undefined;
+  const context = {
+    ...(responseId ? { responseId } : {}),
+    requestId: data.requestId,
+    method: data.method,
+    status: data.status,
+    url: typeof data.url === "string" ? safeUrl(data.url) : data.url,
+  };
+  if (data.kind === "error") {
+    addFailure({
+      kind: "diagnostic-collection",
+      operation: "MSW mocked response",
+      ...context,
+      error: safeError(data.error),
+    });
+    return;
   }
-  return [...counts.values()]
-    .filter(count => count.observedResponses > 0)
-    .filter(count => count.observedResponses > count.capturedBodies)
-    .concat(missingBlobs.map(item => ({ response: [item.method, item.url, item.status], observedResponses: 1, capturedBodies: 0 })));
+  if (
+    data.kind !== "response" ||
+    typeof data.requestId !== "string" ||
+    typeof data.method !== "string" ||
+    typeof data.url !== "string" ||
+    !Number.isInteger(data.status) ||
+    typeof data.body !== "string"
+  ) {
+    addFailure({
+      kind: "diagnostic-collection",
+      operation: "MSW mocked response",
+      ...context,
+      error: safeError(new Error("MSW mocked response capture payload omitted response metadata or body.")),
+    });
+    return;
+  }
+  let body;
+  try {
+    body = safeBody(JSON.parse(data.body));
+  } catch {
+    body = safeText(data.body);
+  }
+  record("http", {
+    ...context,
+    headers: safeBody(data.headers),
+    body,
+    bodyCaptureComplete: true,
+    fromServiceWorker: true,
+    captureSource: "msw-response:mocked",
+  });
+}
+
+export function missingResponseBodies(observations) {
+  const blobIds = new Set(observations.filter(item => item.kind === "blob-source").map(item => item.blobId));
+  const missingBlobs = observations
+    .filter(item => item.kind === "http" && item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId))
+    .map(item => ({
+      responseId: item.responseId,
+      ...(item.frameId ? { frameId: item.frameId } : {}),
+      method: item.method,
+      url: item.url,
+      status: item.status,
+      captureSource: "blob-source",
+    }));
+  const incompleteResponses = observations
+    .filter(item => item.kind === "http" && item.captureSource === "playwright")
+    .filter(item => item.bodyCaptureComplete !== true && !["bodyless", "referenced"].includes(item.bodyCaptureStatus))
+    .map(item => ({
+      responseId: item.responseId,
+      ...(item.frameId ? { frameId: item.frameId } : {}),
+      method: item.method,
+      url: item.url,
+      status: item.status,
+      captureSource: "playwright",
+      body: item.body,
+    }));
+  const mockResponseKey = item => JSON.stringify([item.method, item.url, item.status]);
+  const delegatedMockResponses = observations.filter(item => item.kind === "mock-response-delegated");
+  const capturedMockResponses = observations.filter(item =>
+    item.kind === "http" && item.captureSource === "msw-response:mocked" && item.bodyCaptureComplete === true);
+  const delegatedByKey = new Map();
+  const capturedCounts = new Map();
+  for (const item of delegatedMockResponses) {
+    const key = mockResponseKey(item);
+    delegatedByKey.set(key, [...(delegatedByKey.get(key) ?? []), item]);
+  }
+  for (const item of capturedMockResponses) {
+    const key = mockResponseKey(item);
+    capturedCounts.set(key, (capturedCounts.get(key) ?? 0) + 1);
+  }
+  const missingMockResponses = [];
+  for (const [key, delegated] of delegatedByKey) {
+    const missingCount = delegated.length - (capturedCounts.get(key) ?? 0);
+    for (const item of delegated.slice(0, Math.max(0, missingCount))) {
+      missingMockResponses.push({
+        responseId: item.responseId,
+        method: item.method,
+        url: item.url,
+        status: item.status,
+        captureSource: "msw-response:mocked",
+      });
+    }
+  }
+  const delegatedCounts = new Map([...delegatedByKey].map(([key, items]) => [key, items.length]));
+  const extraMockResponses = [];
+  for (const [key, capturedCount] of capturedCounts) {
+    const extraCount = capturedCount - (delegatedCounts.get(key) ?? 0);
+    if (extraCount <= 0) continue;
+    const matching = capturedMockResponses.filter(item => mockResponseKey(item) === key);
+    for (const item of matching.slice(-extraCount)) {
+      extraMockResponses.push({
+        responseId: item.responseId,
+        method: item.method,
+        url: item.url,
+        status: item.status,
+        captureSource: "msw-response:mocked-unmatched",
+      });
+    }
+  }
+  const seenMockRequestIds = new Set();
+  const duplicateMockResponses = [];
+  for (const item of capturedMockResponses) {
+    const requestId = item.responseId?.requestId;
+    if (typeof requestId !== "string") continue;
+    if (seenMockRequestIds.has(requestId)) {
+      duplicateMockResponses.push({
+        responseId: item.responseId,
+        method: item.method,
+        url: item.url,
+        status: item.status,
+        captureSource: "msw-response:mocked-duplicate",
+      });
+    } else {
+      seenMockRequestIds.add(requestId);
+    }
+  }
+  return [...missingBlobs, ...incompleteResponses, ...missingMockResponses, ...extraMockResponses, ...duplicateMockResponses];
+}
+
+function samePlaywrightResponse(first, second) {
+  return first?.source === "playwright" && second?.source === "playwright" &&
+    typeof first.requestId === "string" && first.requestId === second.requestId;
+}
+
+export function isAcceptedCaptureFailure(failure, failures = [], observations = []) {
+  if (failure?.kind !== "diagnostic-collection") return false;
+  const bodyReadFailure = failure.operation === "response body"
+    ? failure
+    : failures.find(other =>
+      other?.kind === "diagnostic-collection" && other.operation === "response body" &&
+      samePlaywrightResponse(failure.responseId, other.responseId) &&
+      other.frameId === failure.frameId &&
+      /No data found for resource with given identifier/i.test(other.error?.message ?? ""));
+  const responseBodyReadFailed = bodyReadFailure &&
+    /No data found for resource with given identifier/i.test(bodyReadFailure.error?.message ?? "");
+  if (failure.operation === "response body" && failure.method === "OPTIONS" &&
+      /No data found for resource with given identifier/i.test(failure.error?.message ?? "")) {
+    return true;
+  }
+  const isOptionsVerification = failure.operation === "verify complete response body capture" &&
+    failure.method === "OPTIONS" && failures.some(other =>
+      other?.kind === "diagnostic-collection" && other.operation === "response body" &&
+      other.method === "OPTIONS" && samePlaywrightResponse(failure.responseId, other.responseId) &&
+      /No data found for resource with given identifier/i.test(other.error?.message ?? ""));
+  if (isOptionsVerification) return true;
+  if (!["response body", "verify complete response body capture"].includes(failure.operation)) return false;
+  const requestWasAborted = failures.some(other =>
+    other?.kind === "requestfailed" && samePlaywrightResponse(failure.responseId, other.responseId) &&
+    other.error === "net::ERR_ABORTED" && typeof failure.frameId === "string" &&
+    other.frameId === failure.frameId);
+  const readFailureAt = Date.parse(bodyReadFailure?.at ?? "");
+  const frameDisappearedDuringRead = typeof failure.frameId === "string" && observations.some(other => {
+    if (other?.kind !== "frame-detached" || other.frameId !== failure.frameId) return false;
+    if (Number.isInteger(other.diagnosticOrder) && Number.isInteger(bodyReadFailure?.diagnosticOrder)) {
+      return other.diagnosticOrder < bodyReadFailure.diagnosticOrder;
+    }
+    return Number.isFinite(readFailureAt) && Number.isFinite(Date.parse(other.at ?? "")) &&
+      Date.parse(other.at) < readFailureAt;
+  });
+  return responseBodyReadFailed && requestWasAborted && frameDisappearedDuringRead;
+}
+
+export function isConsoleCopyOfExpectedHttpFailure(failure, failures = [], expectedHttpFailure = () => false) {
+  if (failure?.kind !== "console:error" ||
+      failure.text !== "Failed to load resource: the server responded with a status of 403 ()" ||
+      typeof failure.location?.url !== "string") return false;
+  return failures.some(other =>
+    other?.kind === "http" && other.url === failure.location.url && expectedHttpFailure(other));
+}
+
+export function classifyLiveRun({
+  requiredAssertions = [],
+  assertions = [],
+  failures = [],
+  observations = [],
+  cleanupStatus,
+  firstPartyOrigins = [],
+  acceptedCaptureFailure = () => false,
+  expectedHttpFailure = () => false,
+  expectedConsoleFailure = () => false,
+  evidenceWriteFailed = false,
+}) {
+  const origins = new Set(firstPartyOrigins.map(origin => {
+    try {
+      return new URL(origin).origin;
+    } catch {
+      return "";
+    }
+  }).filter(Boolean));
+  const blockingFailures = [];
+  const thirdPartyDiagnostics = [];
+  const acceptedCaptureFailures = [];
+  const expectedHttpFailures = [];
+  const expectedConsoleFailures = [];
+  const warnings = [];
+  const failedAssertions = assertions.filter(assertion => assertion.passed !== true);
+  const missingAssertions = requiredAssertions.filter(name =>
+    !assertions.some(assertion => assertion.name === name && assertion.passed === true)
+  );
+  let captureIncomplete = false;
+
+  for (const failure of failures) {
+    const kind = failure.failureKind ?? failure.kind;
+    if (kind === "console:warning") {
+      warnings.push(failure);
+      continue;
+    }
+    if (kind?.startsWith("console:") && expectedConsoleFailure(failure, failures, expectedHttpFailure)) {
+      expectedConsoleFailures.push(failure);
+      continue;
+    }
+    if (acceptedCaptureFailure(failure, failures, observations)) {
+      acceptedCaptureFailures.push(failure);
+      captureIncomplete = true;
+      continue;
+    }
+    if (kind === "http" && expectedHttpFailure(failure)) {
+      expectedHttpFailures.push(failure);
+      continue;
+    }
+    if (kind === "diagnostic-collection" || kind === "diagnostic-drain") captureIncomplete = true;
+    const sourceUrl = kind?.startsWith("console:")
+      ? failure.location?.url
+      : failure.url ?? failure.context?.url ?? failure.response?.url;
+    let sourceOrigin;
+    if (typeof sourceUrl === "string") {
+      try {
+        sourceOrigin = new URL(sourceUrl).origin;
+      } catch {
+        sourceOrigin = undefined;
+      }
+    }
+    if (sourceOrigin && !origins.has(sourceOrigin)) {
+      thirdPartyDiagnostics.push(failure);
+    } else {
+      blockingFailures.push(failure);
+    }
+  }
+
+  for (const name of missingAssertions) {
+    blockingFailures.push({ kind: "assertion-missing", name });
+  }
+  for (const assertion of failedAssertions) {
+    blockingFailures.push({ kind: "assertion-failed", assertion });
+  }
+  if (cleanupStatus !== "verified") {
+    blockingFailures.push({ kind: "cleanup", status: cleanupStatus ?? "unknown" });
+  }
+  if (evidenceWriteFailed) {
+    blockingFailures.push({ kind: "evidence-write", error: "The run log could not be written completely." });
+  }
+
+  return {
+    workflowStatus: blockingFailures.length === 0 ? "passed" : "failed",
+    cleanupStatus: cleanupStatus === "verified" ? "verified" : "failed",
+    captureStatus: captureIncomplete ? "incomplete" : "complete",
+    requiredAssertions,
+    passedAssertions: assertions.filter(assertion => assertion.passed === true).length,
+    missingAssertions,
+    failedAssertions,
+    blockingFailures,
+    thirdPartyDiagnostics,
+    acceptedCaptureFailures,
+    expectedHttpFailures,
+    expectedConsoleFailures,
+    warnings,
+  };
 }
 
 async function serializeResponseBody(responseBody, responseHeaders, context, options) {
@@ -761,15 +723,32 @@ async function serializeResponseBody(responseBody, responseHeaders, context, opt
 
 async function captureResponse(response, options) {
   const request = response.request();
+  const responseId = options.responseIdFor(request);
+  const frameId = options.frameIdForRequest(request);
   const url = safeUrl(response.url());
-  const mainFrame = responseIsMainFrame(response, options.addFailure);
+  const resourceType = request.resourceType();
+  const fromServiceWorker = typeof response.fromServiceWorker === "function"
+    ? response.fromServiceWorker()
+    : undefined;
+  const isBlob = response.url().startsWith("blob:");
+  const isMockResponse = options.mockResponseBodiesOrigin && fromServiceWorker &&
+    new URL(response.url()).origin === options.mockResponseBodiesOrigin;
+  if (isMockResponse) {
+    options.record("mock-response-delegated", {
+      responseId,
+      method: request.method(),
+      url,
+      status: response.status(),
+    });
+    return;
+  }
   const context = {
+    responseId,
+    ...(frameId ? { frameId } : {}),
     url,
     method: request.method(),
     status: response.status(),
-    ...(typeof response.fromServiceWorker === "function"
-      ? { fromServiceWorker: response.fromServiceWorker() }
-      : {}),
+    ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
   };
   const responseHeadersTask = collect(
     "response headers",
@@ -778,18 +757,14 @@ async function captureResponse(response, options) {
     options.addFailure
   );
   const redirectResponse = context.status >= 300 && context.status <= 399;
-  const responseBodyTask = options.mockResponseBodiesOrigin && context.fromServiceWorker &&
-    new URL(response.url()).origin === options.mockResponseBodiesOrigin
-    ? Promise.resolve({ captureSource: "msw-response:mocked" })
-    : options.cdpStreams && response.url().startsWith("blob:")
+  const bodylessResponse = request.method() === "HEAD" || [204, 304].includes(context.status) || redirectResponse;
+  const bodylessReason = redirectResponse
+    ? "Playwright does not expose response bodies for 3xx responses"
+    : "HTTP response has no body";
+  const responseBodyTask = isBlob
     ? Promise.resolve({ captureSource: "blob-source", blobId: createHash("sha256").update(response.url()).digest("hex") })
-    : redirectResponse
-    ? Promise.resolve({
-        unavailable: true,
-        reason: "Playwright does not expose response bodies for 3xx responses",
-      })
-    : options.cdpStreams && (mainFrame === true || !["document", "script"].includes(request.resourceType()))
-    ? Promise.resolve({ captureSource: "cdp-stream" })
+    : bodylessResponse
+    ? Promise.resolve({ unavailable: true, reason: bodylessReason })
     : collect(
         "response body",
         () => (typeof response.body === "function" ? response.body() : response.text()),
@@ -798,7 +773,6 @@ async function captureResponse(response, options) {
       );
   const [responseHeaders, responseBody] = await Promise.all([responseHeadersTask, responseBodyTask]);
   const serialized = await serializeResponseBody(responseBody, responseHeaders, context, options);
-  const body = serialized.body;
   const requestHeaders = await collect(
     "request headers",
     () => readHeaders(request),
@@ -811,22 +785,40 @@ async function captureResponse(response, options) {
     context,
     options.addFailure
   );
+  const bodyCaptureStatus = isBlob
+    ? "referenced"
+    : bodylessResponse
+    ? "bodyless"
+    : serialized.bodyCaptured
+    ? "complete"
+    : "incomplete";
   const item = {
+    responseId,
+    ...(frameId ? { frameId } : {}),
     status: response.status(),
     method: request.method(),
-    resourceType: request.resourceType(),
+    resourceType,
     url,
     requestHeaders: safeHeaders(requestHeaders),
     headers: safeHeaders(responseHeaders),
     requestBody: requestData,
-    body,
-    ...(mainFrame !== undefined ? { mainFrame } : {}),
-    ...(context.fromServiceWorker !== undefined
-      ? { fromServiceWorker: context.fromServiceWorker }
-      : {}),
+    body: serialized.body,
+    bodyCaptureComplete: bodylessResponse || serialized.bodyCaptured,
+    bodyCaptureStatus,
+    captureSource: "playwright",
+    ...(context.fromServiceWorker !== undefined ? { fromServiceWorker: context.fromServiceWorker } : {}),
   };
   options.record("http", item);
-  if (response.status() >= 400) options.addFailure({ kind: "http", ...item });
+  if (response.status() >= 400) {
+    options.addFailure({
+      kind: "http",
+      responseId,
+      url,
+      method: request.method(),
+      resourceType,
+      status: response.status(),
+    });
+  }
 }
 
 async function captureConsole(message, options) {
@@ -840,13 +832,25 @@ async function captureConsole(message, options) {
   if (message.type() === "error" || message.type() === "warning") {
     options.addFailure({ kind: `console:${message.type()}`, ...item });
   }
+  if (message.text().startsWith("MSW mocked response capture hook unavailable: ")) {
+    options.addFailure({
+      kind: "diagnostic-collection",
+      operation: "MSW mocked response body hook",
+      ...item,
+      error: safeError(new Error(message.text())),
+    });
+  }
   if (message.text() === "Blob source capture failed") {
     options.addFailure({ kind: "diagnostic-collection", operation: "blob source binding", ...item });
   }
 }
 
 async function captureRequestFailure(request, options) {
+  const responseId = options.responseIdFor(request);
+  const frameId = options.frameIdForRequest(request);
   const context = {
+    responseId,
+    ...(frameId ? { frameId } : {}),
     url: safeUrl(request.url()),
     method: request.method(),
     resourceType: request.resourceType(),
@@ -875,16 +879,51 @@ async function captureRequestFailure(request, options) {
 
 export function installPageDiagnostics(
   page,
-  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin, cdpStreams } = {}
+  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin } = {}
 ) {
+  let diagnosticOrder = 0;
+  const recordEvent = (kind, item) => record(kind, { ...item, diagnosticOrder: ++diagnosticOrder });
+  const addDiagnosticFailure = item => addFailure({ ...item, diagnosticOrder: ++diagnosticOrder });
   let binarySequence = 0;
+  const requestIds = new WeakMap();
+  const frameIds = new WeakMap();
+  const requestFrameIds = new WeakMap();
+  let requestSequence = 0;
+  let frameSequence = 0;
   const options = {
-    record,
-    addFailure,
+    record: recordEvent,
+    addFailure: addDiagnosticFailure,
     binaryArtifactDir,
     mockResponseBodiesOrigin,
-    cdpStreams,
     nextBinaryArtifact: () => ++binarySequence,
+    responseIdFor(request) {
+      let requestId = requestIds.get(request);
+      if (!requestId) {
+        requestId = "playwright-request-" + (++requestSequence);
+        requestIds.set(request, requestId);
+      }
+      return { source: "playwright", requestId };
+    },
+    frameIdFor(frame) {
+      if (!frame || (typeof frame !== "object" && typeof frame !== "function")) return undefined;
+      let frameId = frameIds.get(frame);
+      if (!frameId) {
+        frameId = "playwright-frame-" + (++frameSequence);
+        frameIds.set(frame, frameId);
+      }
+      return frameId;
+    },
+    frameIdForRequest(request) {
+      let frameId = requestFrameIds.get(request);
+      if (frameId) return frameId;
+      try {
+        frameId = options.frameIdFor(request.frame());
+      } catch {
+        return undefined;
+      }
+      if (frameId) requestFrameIds.set(request, frameId);
+      return frameId;
+    },
   };
   const listeners = new Map();
   const listen = (event, listener) => {
@@ -892,16 +931,19 @@ export function installPageDiagnostics(
     listeners.set(event, listener);
   };
   listen("console", (message) => {
-    track(pending, "console capture", captureConsole(message, options), {}, addFailure);
+    track(pending, "console capture", captureConsole(message, options), {}, options.addFailure);
   });
   listen("pageerror", (error) => {
-    addFailure({ kind: "pageerror", error: safeError(error) });
+    options.addFailure({ kind: "pageerror", error: safeError(error) });
   });
   listen("crash", () => {
-    addFailure({
+    options.addFailure({
       kind: "page-crash",
       error: { name: "PageCrash", message: "The page crashed.", stack: "" },
     });
+  });
+  listen("framedetached", (frame) => {
+    options.record("frame-detached", { frameId: options.frameIdFor(frame) });
   });
   listen("requestfailed", (request) => {
     try {
@@ -910,10 +952,10 @@ export function installPageDiagnostics(
         "failed request capture",
         captureRequestFailure(request, options),
         { url: safeUrl(request.url()), method: request.method() },
-        addFailure
+        options.addFailure
       );
     } catch (error) {
-      addFailure({
+      options.addFailure({
         kind: "diagnostic-collection",
         operation: "failed request metadata",
         error: safeError(error),
@@ -927,10 +969,10 @@ export function installPageDiagnostics(
         "response capture",
         captureResponse(response, options),
         { url: safeUrl(response.url()), method: response.request().method() },
-        addFailure
+        options.addFailure
       );
     } catch (error) {
-      addFailure({
+      options.addFailure({
         kind: "diagnostic-collection",
         operation: "response metadata",
         error: safeError(error),

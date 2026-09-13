@@ -4,15 +4,14 @@ import { test as base } from "@playwright/test";
 import { MOCK_USER, MOCK_VIRTUAL_KEY } from "../../src/mocks/data";
 import {
   installPageDiagnostics,
-  drainPending,
-  drainBeforeClose,
+  closeCapturedPage,
   configurePageCapture,
   MOCK_RESPONSE_CAPTURE_HOOK,
-  missingMockResponses,
-  missingCdpStreamResponses,
+  captureMockResponse,
+  missingResponseBodies,
+  isAcceptedCaptureFailure,
   safeBody,
   safeError,
-  safeText,
 } from "./diagnostics.mjs";
 
 type DiagnosticFixtures = {
@@ -37,63 +36,10 @@ export const test = base.extend<DiagnosticFixtures>({
         const safeValue = safeBody(value);
         failures.push({ ...(safeValue as Record<string, unknown>), at: new Date().toISOString() });
       };
-      const recordMockedResponse = (payload: unknown) => {
-        const data = payload && typeof payload === "object"
-          ? payload as Record<string, unknown>
-          : {};
-        const context = {
-          requestId: data.requestId,
-          method: data.method,
-          status: data.status,
-          url: data.url,
-        };
-        if (data.kind === "error") {
-          addFailure({
-            kind: "diagnostic-collection",
-            operation: "MSW mocked response",
-            ...context,
-            payload: data,
-            error: safeError(data.error),
-          });
-          return;
-        }
-        if (
-          data.kind !== "response" ||
-          typeof data.requestId !== "string" ||
-          typeof data.method !== "string" ||
-          typeof data.url !== "string" ||
-          !Number.isInteger(data.status) ||
-          typeof data.body !== "string"
-        ) {
-          addFailure({
-            kind: "diagnostic-collection",
-            operation: "MSW mocked response",
-            ...context,
-            error: safeError(new Error("MSW mocked response capture payload omitted response metadata or body.")),
-            payload: data,
-          });
-          return;
-        }
-        let body: unknown;
-        try {
-          body = safeBody(JSON.parse(data.body));
-        } catch {
-          body = safeText(data.body);
-        }
-        record("http", {
-          ...context,
-          headers: safeBody(data.headers),
-          body,
-          fromServiceWorker: true,
-          captureSource: "msw-response:mocked",
-        });
-      };
+      const recordMockedResponse = (payload: unknown) => captureMockResponse(payload, { record, addFailure });
       let testFailure: unknown;
-      let cdpStreams: Awaited<ReturnType<typeof configurePageCapture>>["cdpStreams"] | undefined;
       try {
-        const configured = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir });
-        const { cdpStreams: streams, ...configuration } = configured;
-        cdpStreams = streams;
+        const configuration = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir });
         record("diagnostic-config", configuration);
       } catch (error) {
         const failure = {
@@ -125,7 +71,6 @@ export const test = base.extend<DiagnosticFixtures>({
         pending,
         binaryArtifactDir,
         mockResponseBodiesOrigin: new URL(testInfo.project.metadata.mockApiBaseUrl).origin,
-        cdpStreams,
       });
       if (!testFailure) {
         try {
@@ -134,61 +79,34 @@ export const test = base.extend<DiagnosticFixtures>({
           testFailure ??= error;
         }
       }
-      const mockDrain = page.evaluate(async () => {
+      const expectedMockResponses = observations.filter((item) =>
+        (item as { kind?: unknown }).kind === "mock-response-delegated"
+      ).length;
+      const mockDrain = page.evaluate(async (expectedCount) => {
         const drain = (globalThis as typeof globalThis & {
-          __devneyaDrainMockResponses?: () => Promise<void>;
+          __devneyaDrainMockResponses?: (expectedCount: number) => Promise<void>;
         }).__devneyaDrainMockResponses;
-        if (drain) await drain();
-      });
+        if (drain) await drain(expectedCount);
+      }, expectedMockResponses);
       pending.push(mockDrain);
       mockDrain.catch((error) => addFailure({
         kind: "diagnostic-collection",
         operation: "drain MSW mocked responses",
         error: safeError(error),
       }));
-      const beforeClose = await drainBeforeClose(pending);
-      try {
-        removeDiagnostics();
-      } catch (error) {
-        failures.push({
-          kind: "diagnostic-collection",
-          operation: "remove page diagnostics listeners",
-          error: safeError(error),
-          at: new Date().toISOString(),
-        });
+      const teardown = await closeCapturedPage({ pending, removeDiagnostics, page });
+      for (const { operation, error } of teardown.closeErrors) {
+        const kind = operation === "close page" ? "page-close" :
+          operation.startsWith("drain") ? "diagnostic-drain" : "diagnostic-collection";
+        const failure = { kind, operation, error: safeError(error), at: new Date().toISOString() };
+        failures.push(failure);
         testFailure ??= error;
       }
-      try {
-        await page.close();
-      } catch (error) {
-        failures.push({
-          kind: "page-close",
-          error: safeError(error),
-          at: new Date().toISOString(),
-        });
-        testFailure ??= error;
+      for (const missing of missingResponseBodies(observations)) {
+        addFailure({ kind: "diagnostic-collection", operation: "verify complete response body capture", ...missing,
+          error: safeError(new Error("Browser response has no complete captured body.")) });
       }
-      try {
-        cdpStreams?.close();
-      } catch (error) {
-        addFailure({ kind: "diagnostic-collection", operation: "close CDP response streams", error: safeError(error) });
-        testFailure ??= error;
-      }
-      const drainAfterClose = await drainPending(pending);
-      for (const missing of missingCdpStreamResponses(observations)) {
-        addFailure({ kind: "diagnostic-collection", operation: "verify complete CDP response capture", ...missing,
-          error: safeError(new Error("Browser response has no complete captured CDP stream.")) });
-      }
-      for (const missing of missingMockResponses(observations)) {
-        addFailure({
-          kind: "diagnostic-collection",
-          operation: "verify complete MSW response capture",
-          ...missing,
-          error: safeError(new Error("Mocked browser responses and captured original bodies do not match.")),
-        });
-      }
-      const drain = [...beforeClose, ...drainAfterClose];
-      const rejected = drain.filter((result) => result.status === "rejected");
+      const rejected = teardown.drainResults.filter((result) => result.status === "rejected");
       if (rejected.length) {
         failures.push({
           kind: "diagnostic-drain",
@@ -229,6 +147,10 @@ export const test = base.extend<DiagnosticFixtures>({
       const payload = safeBody({
         observations,
         failures,
+        captureStatus: failures.some(failure => {
+          const item = failure as { kind?: unknown };
+          return item.kind === "diagnostic-collection" || item.kind === "diagnostic-drain";
+        }) ? "incomplete" : "complete",
         testFailure: testFailure ? safeError(testFailure) : undefined,
       });
       try {
@@ -271,7 +193,7 @@ export const test = base.extend<DiagnosticFixtures>({
           "pageerror",
           "page-crash",
           "page-close",
-        ].includes(item.kind as string);
+        ].includes(item.kind as string) && !isAcceptedCaptureFailure(failure, failures, observations);
       });
       if (hardFailures.length && !testFailure) {
         const error = new Error("Browser diagnostics collection or page execution failed.");

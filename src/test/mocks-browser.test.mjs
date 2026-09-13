@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { drainBeforeClose } from "../../tests/e2e/diagnostics.mjs";
 
 const state = vi.hoisted(() => {
   const listeners = new Map();
@@ -67,6 +68,46 @@ describe("MSW mocked response capture", () => {
     expect(drained).toBe(true);
   });
 
+  it("waits for every Playwright-observed mocked response before detaching the listener", async () => {
+    const { listener, drain } = await loadCapture();
+    const hook = vi.fn();
+    globalThis.__devneyaCaptureMockResponse = hook;
+    let drained = false;
+    const draining = drain(1).then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    expect(state.listeners.get("response:mocked")).toBe(listener);
+
+    listener(event({ body: {}, clone: () => ({ text: async () => "{}" }) }));
+    await draining;
+
+    expect(hook).toHaveBeenCalledOnce();
+    expect(drained).toBe(true);
+    expect(state.listeners.has("response:mocked")).toBe(false);
+  });
+
+  it("reports an expected MSW event that never arrives as a teardown failure", async () => {
+    const { listener, drain } = await loadCapture();
+    globalThis.__devneyaCaptureMockResponse = vi.fn();
+    vi.useFakeTimers();
+
+    try {
+      const drainTask = drain(1);
+      const teardown = drainBeforeClose([drainTask]);
+      await vi.advanceTimersByTimeAsync(5000);
+      const results = await teardown;
+      expect(results[0].status).toBe("rejected");
+      expect(results[0].reason.message).toContain("teardown window");
+      expect(state.listeners.get("response:mocked")).toBe(listener);
+
+      listener(event({ body: {}, clone: () => ({ text: async () => "{}" }) }));
+      await drainTask;
+      expect(state.listeners.has("response:mocked")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("forwards synchronous clone failures through the diagnostic hook", async () => {
     const { listener, drain } = await loadCapture();
     const hook = vi.fn();
@@ -77,5 +118,18 @@ describe("MSW mocked response capture", () => {
       kind: "error",
       error: expect.objectContaining({ name: "Error", message: "clone failed" }),
     }));
+  });
+
+  it("reports a missing diagnostic hook instead of silently dropping the mocked body", async () => {
+    const { listener, drain } = await loadCapture();
+    const error = vi.spyOn(globalThis.console, "error").mockImplementation(() => {});
+
+    try {
+      listener(event({ body: {}, clone: () => ({ text: async () => "{}" }) }));
+      await drain();
+      expect(error).toHaveBeenCalledWith("MSW mocked response capture hook unavailable: request-1");
+    } finally {
+      error.mockRestore();
+    }
   });
 });

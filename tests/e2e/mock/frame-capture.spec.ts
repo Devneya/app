@@ -56,7 +56,7 @@ async function startFixture() {
           if (event.data === 'worker-ready') worker.postMessage('fetch');
           if (event.data === 'worker-body-complete') {
             document.body.dataset.worker = 'body-complete';
-            worker.terminate();
+            window.__terminateCaptureWorker = () => worker.terminate();
             URL.revokeObjectURL(url);
           }
         });
@@ -82,7 +82,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function findBody(observations: unknown[], path: string) {
-  return observations.map(asRecord).find(item => item?.kind === "http" && String(item.url).includes(path) && item.captureSource === "cdp-stream");
+  return observations.map(asRecord).find(item => item?.kind === "http" && String(item.url).includes(path) && item.captureSource === "playwright");
 }
 
 function bodyArtifact(body: Record<string, unknown>) {
@@ -96,7 +96,6 @@ test("captures the complete body from a cross-origin blob iframe", async ({ page
     await page.goto(`${fixture.origin}/parent?mode=complete`);
     await expect.poll(() => asRecord(findBody(browserDiagnostics.observations, "/blob-body"))?.bodyCaptureComplete ?? false, { timeout: 15_000 }).toBe(true);
     const body = asRecord(findBody(browserDiagnostics.observations, "/blob-body"));
-    expect(body?.availableBodyCaptureComplete).toBe(true);
     expect(asRecord(body?.body)?.byteLength).toBe(BODY.length);
     await expect(readFile(bodyArtifact(body ?? {}))).resolves.toEqual(BODY);
   } finally {
@@ -104,7 +103,7 @@ test("captures the complete body from a cross-origin blob iframe", async ({ page
   }
 });
 
-test("retains an aborted blob body prefix and the actual request failure", async ({ page, browserDiagnostics }) => {
+test("marks a response body incomplete when its blob frame disappears during the read", async ({ page, browserDiagnostics }) => {
   const fixture = await startFixture();
   try {
     await page.goto(`${fixture.origin}/parent?mode=partial`);
@@ -112,18 +111,25 @@ test("retains an aborted blob body prefix and the actual request failure", async
       const item = asRecord(value);
       return item?.kind === "requestfailed" && String(item.url).includes("/blob-body");
     }), { timeout: 15_000 }).toBe(true);
-    await expect.poll(() => {
-      const body = asRecord(findBody(browserDiagnostics.observations, "/blob-body"));
-      return body?.availableBodyCaptureComplete === true && body.bodyCaptureComplete === false;
-    }, { timeout: 15_000 }).toBe(true);
     const body = asRecord(findBody(browserDiagnostics.observations, "/blob-body"));
-    const bytes = await readFile(bodyArtifact(body ?? {}));
-    expect(bytes.length).toBeGreaterThan(0);
-    expect(bytes).toEqual(BODY.subarray(0, bytes.length));
-    expect(browserDiagnostics.failures.some(value => {
+    expect(body?.bodyCaptureComplete).toBe(false);
+    expect(body?.bodyCaptureStatus).toBe("incomplete");
+    expect(browserDiagnostics.observations.map(asRecord).some(item =>
+      item?.kind === "frame-detached" && item.frameId === body?.frameId,
+    )).toBe(true);
+    const bodyFailure = browserDiagnostics.failures.find(value => {
       const item = asRecord(value);
-      return item?.kind === "diagnostic-collection" && String(item.url).includes("/blob-body");
-    })).toBe(false);
+      return item?.kind === "diagnostic-collection" && item.operation === "response body" &&
+        JSON.stringify(item.responseId) === JSON.stringify(body?.responseId);
+    });
+    expect(bodyFailure).toBeTruthy();
+    const frameDetached = browserDiagnostics.observations.map(asRecord).find(item =>
+      item?.kind === "frame-detached" && item.frameId === body?.frameId,
+    );
+    expect(frameDetached?.diagnosticOrder).toBeLessThan(asRecord(bodyFailure)?.diagnosticOrder);
+    expect(browserDiagnostics.observations.map(asRecord).find(item =>
+      item?.kind === "requestfailed" && JSON.stringify(item.responseId) === JSON.stringify(body?.responseId),
+    )).toBeTruthy();
   } finally {
     await fixture.close();
   }
@@ -136,7 +142,7 @@ test("captures a worker blob at creation before termination", async ({ page, bro
     await expect(page.locator("body[data-worker='body-complete']")).toHaveCount(1);
     await expect.poll(() => browserDiagnostics.observations.some(value => {
       const item = asRecord(value);
-      return item?.kind === "http" && String(item.url).includes("/worker-body") && item.captureSource === "cdp-stream" && item.bodyCaptureComplete === true;
+      return item?.kind === "http" && String(item.url).includes("/worker-body") && item.captureSource === "playwright" && item.bodyCaptureComplete === true;
     }), { timeout: 15_000 }).toBe(true);
     const source = browserDiagnostics.observations.map(asRecord).find(item => item?.kind === "blob-source");
     expect(source?.contentType).toBe("application/javascript");
@@ -144,6 +150,9 @@ test("captures a worker blob at creation before termination", async ({ page, bro
     const workerBody = asRecord(findBody(browserDiagnostics.observations, "/worker-body"));
     expect(asRecord(workerBody?.body)?.byteLength).toBe(BODY.length);
     await expect(readFile(bodyArtifact(workerBody ?? {}))).resolves.toEqual(BODY);
+    await page.evaluate(() => (window as typeof window & {
+      __terminateCaptureWorker?: () => void;
+    }).__terminateCaptureWorker?.());
   } finally {
     await fixture.close();
   }

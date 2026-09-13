@@ -7,7 +7,7 @@ type MockResponseCaptureHook = (payload: unknown) => void | Promise<void>;
 
 type MockResponseCaptureGlobal = typeof globalThis & {
   __devneyaCaptureMockResponse?: MockResponseCaptureHook;
-  __devneyaDrainMockResponses?: () => Promise<void>;
+  __devneyaDrainMockResponses?: (expectedCount?: number) => Promise<void>;
 };
 
 type MockResponseEvent = {
@@ -17,10 +17,22 @@ type MockResponseEvent = {
 };
 
 const pendingMockResponseCaptures = new Set<Promise<void>>();
+const mockResponseWaiters = new Set<{ expectedCount: number; resolve: () => void }>();
+let mockResponseEventCount = 0;
 
 const captureMockedResponse = (event: MockResponseEvent) => {
+  mockResponseEventCount += 1;
+  for (const waiter of mockResponseWaiters) {
+    if (mockResponseEventCount >= waiter.expectedCount) {
+      mockResponseWaiters.delete(waiter);
+      waiter.resolve();
+    }
+  }
   const hook = (globalThis as MockResponseCaptureGlobal).__devneyaCaptureMockResponse;
-  if (typeof hook !== "function") return;
+  if (typeof hook !== "function") {
+    console.error(`MSW mocked response capture hook unavailable: ${event.requestId}`);
+    return;
+  }
   const context = {
     requestId: event.requestId,
     method: event.request.method,
@@ -51,7 +63,14 @@ const captureMockedResponse = (event: MockResponseEvent) => {
 
 worker.events.on("response:mocked", captureMockedResponse);
 
-(globalThis as MockResponseCaptureGlobal).__devneyaDrainMockResponses = async () => {
+(globalThis as MockResponseCaptureGlobal).__devneyaDrainMockResponses = async (
+  expectedCount = mockResponseEventCount,
+) => {
+  const waitForExpectedEvents = (expectedCount: number) => {
+    if (mockResponseEventCount >= expectedCount) return Promise.resolve();
+    return new Promise<void>((resolve) => mockResponseWaiters.add({ expectedCount, resolve }));
+  };
+  await waitForExpectedEvents(expectedCount);
   worker.events.removeListener("response:mocked", captureMockedResponse);
   await Promise.all([...pendingMockResponseCaptures]);
 };
