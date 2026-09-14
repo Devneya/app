@@ -61,13 +61,18 @@ All must pass. Do not rely on manual browser review alone.
 
 Mock subscribe returns a Dodo-shaped checkout URL (`checkout.dodopayments.com`); MSW does not host an in-app checkout page.
 
-## GitHub Pages deploy (main branch)
+## Releases and deployment
 
-CI builds with `VITE_USE_MOCKS=false` and deploys `dist/` to GitHub Pages after lint, typecheck, unit tests, and e2e pass.
+Pushes to `main` run checks and publish staging and production bundles under a
+full-source-commit tag. Pushes never deploy. Staging deployment and production
+GitHub Pages deployment are separate manual workflows that require an exact
+release tag. Production deployment follows staging acceptance.
 
 Required repository secret:
 
-- `VITE_GOTRUE_ANON_KEY` — same value as playground's `VITE_SUPABASE_PUBLIC_KEY` (GoTrue anon/public key from the VM deploy env).
+- `VITE_GOTRUE_ANON_KEY` — production GoTrue anon/public key.
+- `VITE_GOTRUE_STAGE_ANON_KEY` — staging GoTrue public client key in repository variables.
+- Staging deployment uses the `CLOUDFLARE_PAGES_WRITE_TOKEN` Actions secret and `CLOUDFLARE_ACCOUNT_ID` repository variable.
 
 GitHub Pages serves production at `app.devneya.com`; DNS and Pages custom-domain settings are managed outside this repository.
 

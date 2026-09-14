@@ -40,11 +40,18 @@ npm run test:e2e
 | `VITE_GOTRUE_ANON_KEY` | GoTrue anon/public key |
 | `VITE_USE_MOCKS` | Enable MSW (`true` for local dev and CI) |
 
-## GitHub Pages deploy
+## Releases and deployment
 
-On push to `main`, CI runs lint → typecheck → unit tests → e2e → production build → GitHub Pages deploy.
+A push to `main` runs checks and creates a `sha-<full-commit>` GitHub release
+containing staging and production bundles. A push never deploys either bundle.
+Deploy staging by manually running the staging deployment workflow with the
+exact release tag. Deploy production by manually running the production
+deployment workflow with the exact release tag, after staging acceptance.
 
-Production build uses `VITE_USE_MOCKS=false`, `VITE_API_BASE_URL=https://api.devneya.com`, and `VITE_GOTRUE_ANON_KEY` from a repository secret (same value as playground's `VITE_SUPABASE_PUBLIC_KEY`).
+The production bundle uses `VITE_USE_MOCKS=false`,
+`VITE_API_BASE_URL=https://api.devneya.com`, and
+`VITE_GOTRUE_ANON_KEY` from a repository secret. The staging bundle uses the
+staging API URL and its staging GoTrue public key from a repository secret.
 
 The build copies `dist/index.html` to `dist/404.html` for SPA deep-link fallback on Pages.
 

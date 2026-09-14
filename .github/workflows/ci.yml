@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, remediation-staging-2026-09-03]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -57,9 +57,12 @@ jobs:
           path: test-results/
           if-no-files-found: error
 
-  build:
+  release:
     runs-on: ubuntu-latest
     needs: e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,34 +70,39 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - name: Build staging bundle
+        run: |
+          set -euo pipefail
+          npm run build
+          printf '{"environment":"staging","source":"%s"}\n' "$GITHUB_SHA" > dist/version.json
+          tar -czf "devneya-app-staging-${GITHUB_SHA}.tar.gz" -C dist .
+        env:
+          VITE_USE_MOCKS: "false"
+          VITE_API_BASE_URL: https://api.stage.devneya.com
+          VITE_GOTRUE_ANON_KEY: ${{ vars.VITE_GOTRUE_STAGE_ANON_KEY }}
+      - name: Build production bundle
+        run: |
+          set -euo pipefail
+          npm run build
+          printf '{"environment":"production","source":"%s"}\n' "$GITHUB_SHA" > dist/version.json
+          tar -czf "devneya-app-production-${GITHUB_SHA}.tar.gz" -C dist .
         env:
           VITE_USE_MOCKS: "false"
           VITE_API_BASE_URL: https://api.devneya.com
-          VITE_GOTRUE_ANON_KEY: ${{ github.ref != 'refs/heads/main' && 'ci-build-key' || secrets.VITE_GOTRUE_ANON_KEY }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-  deploy:
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          VITE_GOTRUE_ANON_KEY: ${{ secrets.VITE_GOTRUE_ANON_KEY }}
+      - name: Publish immutable app release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace its assets." >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            "devneya-app-staging-${GITHUB_SHA}.tar.gz" \
+            "devneya-app-production-${GITHUB_SHA}.tar.gz" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "App bundles built from main commit $GITHUB_SHA. Deploy explicitly by selecting this tag."
