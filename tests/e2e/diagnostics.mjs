@@ -299,9 +299,35 @@ async function collect(label, read, context, addFailure) {
 
 const pendingTaskDetails = new WeakMap();
 
-export function trackPending(pending, operation, task, context, addFailure) {
+function monotonicNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function snapshotPendingOperations(pending) {
+  return pending.flatMap((task, index) => {
+    const details = pendingTaskDetails.get(task);
+    if (!details || details.settled) return [];
+    return [{
+      operation: details.operation,
+      index,
+      ...details.context,
+      startedAt: details.startedAt,
+      elapsedMs: Math.max(0, Math.round(monotonicNow() - details.startedMonotonicMs)),
+      ...(details.evidenceSnapshot ? { evidence: safeBody(details.evidenceSnapshot()) } : {}),
+    }];
+  });
+}
+
+export function trackPending(pending, operation, task, context, addFailure, { evidenceSnapshot } = {}) {
   const tracked = Promise.resolve(task);
-  const details = { operation, context: safeBody(context ?? {}), settled: false };
+  const details = {
+    operation,
+    context: safeBody(context ?? {}),
+    startedAt: new Date().toISOString(),
+    startedMonotonicMs: monotonicNow(),
+    evidenceSnapshot,
+    settled: false,
+  };
   pendingTaskDetails.set(tracked, details);
   tracked.then(
     () => { details.settled = true; },
@@ -466,14 +492,7 @@ export async function drainBeforeClose(pending) {
           reason: Object.assign(
             new Error("Browser capture exceeded the five-second teardown window; close the page and retain remaining reader errors."),
             {
-              pendingOperations: pending.flatMap((task, index) => {
-                const details = pendingTaskDetails.get(task);
-                return !details || details.settled ? [] : [{
-                  operation: details.operation,
-                  index,
-                  ...details.context,
-                }];
-              }),
+              pendingOperations: snapshotPendingOperations(pending),
             },
           ),
         }]), 5000);
@@ -484,10 +503,27 @@ export async function drainBeforeClose(pending) {
   }
 }
 
-export async function closeCapturedPage({ pending = [], removeDiagnostics, page } = {}) {
+export async function closeCapturedPage({ pending = [], removeDiagnostics, page, record, recordLifecycle } = {}) {
   const settledTasks = new Map();
   const drainTimeouts = [];
   const closeErrors = [];
+  const note = (phase, details = {}) => {
+    try {
+      const item = { phase, ...details };
+      if (recordLifecycle) {
+        recordLifecycle("capture-shutdown", item);
+      } else {
+        record?.("capture-shutdown", {
+          ...item,
+          eventAt: new Date().toISOString(),
+          eventMonotonicMs: monotonicNow(),
+        });
+      }
+    } catch (error) {
+      closeErrors.push({ operation: `record capture shutdown ${phase}`, error });
+    }
+  };
+  const pendingSnapshot = () => snapshotPendingOperations(pending);
   const drain = async operation => {
     try {
       const results = await drainBeforeClose(pending);
@@ -502,15 +538,34 @@ export async function closeCapturedPage({ pending = [], removeDiagnostics, page 
   const attempt = async (operation, action) => {
     try {
       await action?.();
+      return true;
     } catch (error) {
       closeErrors.push({ operation, error });
+      return false;
     }
   };
 
+  note("drain-before-close-started", { pendingOperations: pendingSnapshot() });
   await drain("drain before capture shutdown");
-  await attempt("remove page diagnostics listeners", removeDiagnostics);
-  await attempt("close page", () => page?.close());
+  note("drain-before-close-finished", {
+    pendingOperations: pendingSnapshot(),
+    timedOut: drainTimeouts.length > 0,
+  });
+  note("diagnostic-listener-removal-started");
+  const listenersRemoved = await attempt("remove page diagnostics listeners", removeDiagnostics);
+  note(listenersRemoved ? "diagnostic-listeners-removed" : "diagnostic-listener-removal-failed", {
+    ...(!listenersRemoved ? { error: safeError(closeErrors.at(-1)?.error) } : {}),
+  });
+  note("page-close-requested", { pendingOperations: pendingSnapshot() });
+  const pageClosed = page ? await attempt("close page", () => page.close()) : undefined;
+  note(pageClosed === true ? "page-close-completed" : pageClosed === false ? "page-close-failed" : "page-close-not-opened", {
+    ...(pageClosed === false ? { error: safeError(closeErrors.at(-1)?.error) } : {}),
+  });
   await drain("drain after page close");
+  note("post-close-drain-finished", {
+    pendingOperations: pendingSnapshot(),
+    timedOut: drainTimeouts.length > 0,
+  });
   const drainResults = [...settledTasks.values(), ...drainTimeouts].map(result =>
     Object.fromEntries(Object.entries(result).filter(([key]) => key !== "taskIndex"))
   );
@@ -574,30 +629,139 @@ export function captureMockResponse(payload, { record, addFailure }) {
   });
 }
 
+function reconcilePlaywrightResponseBodies(observations) {
+  const requests = new Map();
+  for (const item of observations) {
+    const requestId = item?.responseId?.source === "playwright" ? item.responseId.requestId : undefined;
+    if (typeof requestId !== "string") continue;
+    let evidence = requests.get(requestId);
+    if (!evidence) {
+      evidence = {
+        requestId,
+        responseSeen: false,
+        bodyCaptured: false,
+        bodyless: false,
+        referenced: false,
+        delegated: false,
+        bodyReadFailed: false,
+        bodyPending: false,
+        requestFinished: false,
+        requestFailed: false,
+      };
+      requests.set(requestId, evidence);
+    }
+
+    if (item.kind === "request-finished" || item.kind === "request-failed") {
+      evidence.requestFinished ||= item.kind === "request-finished";
+      evidence.requestFailed ||= item.kind === "request-failed";
+    } else if (item.kind === "response-received") {
+      evidence.responseSeen = true;
+    } else if (item.kind === "capture-component-started" && item.component === "responseBody") {
+      evidence.responseSeen = true;
+      evidence.bodyPending = true;
+    } else if (item.kind === "capture-component" && item.component === "responseBody") {
+      evidence.responseSeen = true;
+      evidence.bodyCaptured ||= item.bodyCaptured === true || item.status === "captured";
+      evidence.bodyless ||= item.status === "bodyless" || item.bodyCaptureStatus === "bodyless";
+      evidence.referenced ||= item.status === "referenced" || item.bodyCaptureStatus === "referenced";
+      evidence.delegated ||= item.status === "delegated" || item.bodyCaptureStatus === "delegated";
+      evidence.bodyReadFailed ||= item.status === "failed" || item.bodyCaptureStatus === "incomplete";
+      evidence.bodyPending ||= item.status === "pending";
+      evidence.captureSource = item.captureSource ?? evidence.captureSource;
+      if (item.body !== undefined) evidence.body = item.body;
+    } else if (item.kind === "http") {
+      evidence.responseSeen = true;
+      evidence.bodyCaptured ||= item.bodyCaptured === true ||
+        (item.bodyCaptureComplete === true && !["bodyless", "referenced", "delegated"].includes(item.bodyCaptureStatus));
+      evidence.bodyless ||= item.bodyCaptureStatus === "bodyless";
+      evidence.referenced ||= item.bodyCaptureStatus === "referenced" || item.body?.captureSource === "blob-source";
+      evidence.delegated ||= item.bodyCaptureStatus === "delegated";
+      evidence.bodyReadFailed ||= item.bodyCaptureStatus === "incomplete" || Boolean(item.body?.collection_error);
+      evidence.captureSource = item.captureSource ?? evidence.captureSource;
+      if (item.body !== undefined) evidence.body = item.body;
+    } else if (item.kind === "mock-response-delegated") {
+      evidence.delegated = true;
+      evidence.responseSeen = true;
+    }
+  }
+
+  for (const evidence of requests.values()) {
+    if (evidence.delegated) {
+      evidence.status = "delegated";
+    } else if (evidence.referenced) {
+      evidence.status = "referenced";
+    } else if (evidence.bodyless) {
+      evidence.status = "bodyless";
+    } else if (evidence.captureSource === "playwright-route-fetch") {
+      evidence.status = evidence.bodyCaptured ? "complete" : evidence.bodyPending ? "pending" : "incomplete";
+      if (!evidence.bodyCaptured && !evidence.bodyPending) evidence.reason = "body-read-failed";
+    } else if (evidence.bodyCaptured) {
+      evidence.status = evidence.requestFinished && !evidence.requestFailed ? "complete" : "unknown";
+      if (evidence.status === "unknown") {
+        evidence.reason = evidence.requestFailed ? "request-failed" : "request-not-finished";
+      }
+    } else if (evidence.bodyReadFailed) {
+      evidence.status = "incomplete";
+      evidence.reason = "body-read-failed";
+    } else if (evidence.bodyPending) {
+      evidence.status = "pending";
+      evidence.reason = "body-capture-pending";
+    } else if (evidence.requestFailed) {
+      evidence.status = "incomplete";
+      evidence.reason = "request-failed";
+    } else if (evidence.responseSeen) {
+      evidence.status = "not-recorded";
+      evidence.reason = "body-capture-not-recorded";
+    } else {
+      evidence.status = "not-applicable";
+    }
+  }
+  return requests;
+}
+
 export function missingResponseBodies(observations) {
+  const bodyEvidence = reconcilePlaywrightResponseBodies(observations);
   const blobIds = new Set(observations.filter(item => item.kind === "blob-source").map(item => item.blobId));
-  const missingBlobs = observations
-    .filter(item => item.kind === "http" && item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId))
-    .map(item => ({
+  const missingBlobs = [];
+  const seenBlobResponses = new Set();
+  for (const item of observations.filter(item =>
+    (item.kind === "http" || item.kind === "capture-component" && item.component === "responseBody") &&
+    item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId))) {
+    const key = item.responseId?.source === "playwright" && typeof item.responseId.requestId === "string"
+      ? item.responseId.requestId
+      : JSON.stringify([item.body.blobId, item.url]);
+    if (seenBlobResponses.has(key)) continue;
+    seenBlobResponses.add(key);
+    missingBlobs.push({
       responseId: item.responseId,
       ...(item.frameId ? { frameId: item.frameId } : {}),
       method: item.method,
       url: item.url,
       status: item.status,
       captureSource: "blob-source",
-    }));
-  const incompleteResponses = observations
-    .filter(item => item.kind === "http" && ["playwright", "playwright-route-fetch"].includes(item.captureSource))
-    .filter(item => item.bodyCaptureComplete !== true && !["bodyless", "referenced"].includes(item.bodyCaptureStatus))
-    .map(item => ({
+    });
+  }
+  const incompleteResponses = [];
+  const seenResponseIds = new Set();
+  for (const item of observations.filter(item => item.kind === "http" && item.responseId?.source === "playwright")) {
+    const requestId = item.responseId.requestId;
+    if (seenResponseIds.has(requestId)) continue;
+    seenResponseIds.add(requestId);
+    const evidence = bodyEvidence.get(requestId);
+    if (["complete", "bodyless", "referenced", "delegated"].includes(evidence?.status)) continue;
+    incompleteResponses.push({
       responseId: item.responseId,
       ...(item.frameId ? { frameId: item.frameId } : {}),
       method: item.method,
       url: item.url,
       status: item.status,
-      captureSource: item.captureSource,
-      body: item.body,
-    }));
+      captureSource: item.captureSource ?? evidence?.captureSource ?? "playwright",
+      bodyCaptureStatus: evidence?.status ?? "not-recorded",
+      ...(evidence?.reason ? { bodyCompletenessReason: evidence.reason } : {}),
+      ...(evidence?.bodyCaptured ? { bodyCaptured: true } : {}),
+      ...(item.body !== undefined ? { body: item.body } : {}),
+    });
+  }
   const mockResponseKey = item => JSON.stringify([item.method, item.url, item.status]);
   const delegatedMockResponses = observations.filter(item => item.kind === "mock-response-delegated");
   const capturedMockResponses = observations.filter(item =>
@@ -658,7 +822,204 @@ export function missingResponseBodies(observations) {
       seenMockRequestIds.add(requestId);
     }
   }
-  return [...missingBlobs, ...incompleteResponses, ...missingMockResponses, ...extraMockResponses, ...duplicateMockResponses];
+  const httpRequestIds = new Set(observations
+    .filter(item => item.kind === "http" && item.responseId?.source === "playwright")
+    .map(item => item.responseId.requestId));
+  const unaggregatedResponses = [];
+  const seenUnaggregatedIds = new Set();
+  for (const item of observations.filter(record => record.kind === "response-received" &&
+    record.responseId?.source === "playwright")) {
+    const requestId = item.responseId.requestId;
+    if (httpRequestIds.has(requestId) || seenUnaggregatedIds.has(requestId)) continue;
+    seenUnaggregatedIds.add(requestId);
+    const evidence = bodyEvidence.get(requestId);
+    if (["complete", "bodyless", "referenced", "delegated"].includes(evidence?.status)) continue;
+    unaggregatedResponses.push({
+      responseId: item.responseId,
+      ...(item.frameId ? { frameId: item.frameId } : {}),
+      method: item.method,
+      url: item.url,
+      status: item.status,
+      captureSource: evidence?.captureSource ?? "playwright",
+      bodyCaptureStatus: evidence?.status ?? "not-recorded",
+      ...(evidence?.reason ? { bodyCompletenessReason: evidence.reason } : {}),
+      ...(evidence?.bodyCaptured ? { bodyCaptured: true } : {}),
+      ...(evidence?.body !== undefined ? { body: evidence.body } : {}),
+    });
+  }
+  return [...missingBlobs, ...incompleteResponses, ...unaggregatedResponses, ...missingMockResponses, ...extraMockResponses, ...duplicateMockResponses];
+}
+
+export function summarizeCaptureLifecycle(observations) {
+  const bodyEvidenceByRequest = reconcilePlaywrightResponseBodies(observations);
+  const requests = new Map();
+  const frameEvents = [];
+  const pageEvents = [];
+  const mswResponses = [];
+  let pendingAtClose = [];
+  const timelineKinds = new Set([
+    "request-started", "response-received", "request-finished", "request-failed",
+  ]);
+  const getRequest = item => {
+    const responseId = item.responseId;
+    if (responseId?.source !== "playwright" || typeof responseId.requestId !== "string") return undefined;
+    let entry = requests.get(responseId.requestId);
+    if (!entry) {
+      entry = {
+        requestId: responseId.requestId,
+        events: [],
+        components: {},
+        failures: [],
+      };
+      requests.set(responseId.requestId, entry);
+    }
+    if (typeof item.frameId === "string") entry.frameId ??= item.frameId;
+    if (typeof item.method === "string") entry.method ??= item.method;
+    if (typeof item.url === "string") entry.url ??= safeUrl(item.url);
+    if (typeof item.resourceType === "string") entry.resourceType ??= item.resourceType;
+    if (typeof item.fromServiceWorker === "boolean") entry.fromServiceWorker ??= item.fromServiceWorker;
+    return entry;
+  };
+
+  for (const item of observations) {
+    if (!item || typeof item !== "object") continue;
+    if (item.kind === "capture-shutdown" && item.phase === "page-close-requested") {
+      pendingAtClose = (item.pendingOperations ?? []).map(operation => ({
+        operation: safeText(operation.operation ?? "unknown"),
+        ...(operation.responseId?.source === "playwright" ? { requestId: operation.responseId.requestId } : {}),
+        ...(typeof operation.frameId === "string" ? { frameId: operation.frameId } : {}),
+        ...(typeof operation.method === "string" ? { method: operation.method } : {}),
+        ...(typeof operation.url === "string" ? { url: safeUrl(operation.url) } : {}),
+        ...(typeof operation.elapsedMs === "number" ? { elapsedMs: operation.elapsedMs } : {}),
+        ...(typeof operation.completedMonotonicMs === "number" ? { completedMonotonicMs: operation.completedMonotonicMs } : {}),
+        ...(operation.evidence ? { evidence: safeBody(operation.evidence) } : {}),
+      }));
+    }
+    if (typeof item.kind === "string" && item.kind.startsWith("frame-")) {
+      frameEvents.push({
+        kind: item.kind,
+        ...(typeof item.frameId === "string" ? { frameId: item.frameId } : {}),
+        ...(typeof item.url === "string" ? { url: safeUrl(item.url) } : {}),
+        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } : {}),
+        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
+        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
+      });
+    }
+    if (["page-close-event", "page-crash"].includes(item.kind) || item.kind === "capture-shutdown") {
+      pageEvents.push({
+        kind: item.kind,
+        ...(typeof item.phase === "string" ? { phase: item.phase } : {}),
+        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } :
+          typeof item.at === "string" ? { eventAt: item.at } : {}),
+        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
+        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
+      });
+    }
+
+    if (item.kind === "http" && item.responseId?.source === "msw") {
+      mswResponses.push({
+        requestId: item.responseId.requestId,
+        method: item.method,
+        ...(typeof item.url === "string" ? { url: safeUrl(item.url) } : {}),
+        status: item.status,
+        bodyCaptureComplete: item.bodyCaptureComplete === true,
+      });
+    }
+
+    const entry = getRequest(item);
+    if (!entry) continue;
+    if (timelineKinds.has(item.kind)) {
+      entry.events.push({
+        kind: item.kind,
+        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } : {}),
+        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
+        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
+        ...(Number.isInteger(item.status) ? { status: item.status } : {}),
+        ...(typeof item.error === "string" ? { error: safeText(item.error) } : {}),
+      });
+    }
+    if (item.kind === "capture-component-started") {
+      entry.components[item.component] = {
+        status: "pending",
+        ...(typeof item.startedAt === "string" ? { startedAt: item.startedAt } : {}),
+        ...(typeof item.startedMonotonicMs === "number" ? { startedMonotonicMs: item.startedMonotonicMs } : {}),
+      };
+    } else if (item.kind === "capture-component") {
+      if (typeof item.captureSource === "string") entry.captureSource ??= item.captureSource;
+      entry.components[item.component] = {
+        status: item.status,
+        ...(typeof item.bodyCaptured === "boolean" ? { bodyCaptured: item.bodyCaptured } : {}),
+        ...(typeof item.bodyCaptureComplete === "boolean" ? { bodyCaptureComplete: item.bodyCaptureComplete } : {}),
+        ...(typeof item.bodyCaptureStatus === "string" ? { bodyCaptureStatus: item.bodyCaptureStatus } : {}),
+        ...(typeof item.bodyCompletenessReason === "string" ? { bodyCompletenessReason: item.bodyCompletenessReason } : {}),
+        ...(typeof item.startedAt === "string" ? { startedAt: item.startedAt } : {}),
+        ...(typeof item.completedAt === "string" ? { completedAt: item.completedAt } : {}),
+        ...(typeof item.elapsedMs === "number" ? { elapsedMs: item.elapsedMs } : {}),
+        ...(typeof item.completedMonotonicMs === "number" ? { completedMonotonicMs: item.completedMonotonicMs } : {}),
+        ...(typeof item.captureSource === "string" ? { captureSource: item.captureSource } : {}),
+      };
+      if (item.component === "responseBody" && item.status === "failed" &&
+          !entry.failures.some(failure => failure.operation === "response body")) {
+        const captureError = item.body?.collection_error;
+        const details = Array.isArray(captureError) ? captureError[0] : captureError;
+        const message = typeof details?.message === "string" ? details.message :
+          typeof captureError === "string" ? captureError : undefined;
+        if (message) {
+          entry.failures.push({
+            kind: "diagnostic-collection",
+            operation: "response body",
+            message: safeText(message),
+          });
+        }
+      }
+    } else if (item.kind === "http") {
+      entry.responseStatus = item.status;
+      entry.responseBodyStatus = item.bodyCaptureStatus ?? (item.bodyCaptureComplete ? "complete" : "incomplete");
+      if (typeof item.captureSource === "string") entry.captureSource = item.captureSource;
+      if (typeof item.resourceType === "string") entry.resourceType ??= item.resourceType;
+      if (typeof item.fromServiceWorker === "boolean") entry.fromServiceWorker ??= item.fromServiceWorker;
+      entry.httpRecord = true;
+    } else if (item.kind === "mock-response-delegated") {
+      entry.responseStatus = item.status;
+      entry.responseBodyStatus = "delegated";
+      entry.captureSource = "msw-response:mocked";
+      entry.delegatedToMSW = true;
+    } else if (item.kind === "diagnostic-collection" || item.kind === "requestfailed" ||
+      (item.kind === "failure" && ["diagnostic-collection", "requestfailed"].includes(item.failureKind))) {
+      const failureKind = item.kind === "failure" ? item.failureKind : item.kind;
+      entry.failures.push({
+        kind: failureKind,
+        operation: safeText(item.operation ?? failureKind),
+        ...(typeof item.error?.message === "string" ? { message: safeText(item.error.message) } :
+          typeof item.error === "string" ? { message: safeText(item.error) } : {}),
+      });
+    }
+  }
+
+  const result = [...requests.values()].map(entry => {
+    entry.events.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
+    entry.responseStatus ??= entry.events.find(event => event.kind === "response-received")?.status;
+    const bodyEvidence = bodyEvidenceByRequest.get(entry.requestId);
+    if (bodyEvidence) {
+      entry.responseBodyStatus = bodyEvidence.status;
+      if (bodyEvidence.bodyCaptured) entry.responseBodyCaptured = true;
+      if (bodyEvidence.reason) entry.responseBodyCompletenessReason = bodyEvidence.reason;
+    } else {
+      entry.responseBodyStatus ??= Number.isInteger(entry.responseStatus) ? "not-recorded" : "not-applicable";
+    }
+    return entry;
+  }).sort((first, second) => (first.events[0]?.timelineSequence ?? 0) - (second.events[0]?.timelineSequence ?? 0));
+  frameEvents.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
+  pageEvents.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
+  return {
+    requestCount: result.length,
+    responseCount: result.filter(entry => Number.isInteger(entry.responseStatus)).length,
+    requests: result,
+    frameEvents,
+    pageEvents,
+    mswResponses,
+    pendingAtClose,
+  };
 }
 
 function samePlaywrightResponse(first, second) {
@@ -886,10 +1247,58 @@ async function serializeResponseBody(responseBody, responseHeaders, context, opt
   return { body: bodyCaptured ? body : responseBody, bodyCaptured, bytes };
 }
 
-async function captureResponse(response, options) {
+function collectionStatus(value) {
+  return isObject(value) && Object.hasOwn(value, "collection_error") ? "failed" : "captured";
+}
+
+function responseHeaderHint(response) {
+  try {
+    return typeof response.headers === "function" ? response.headers() : {};
+  } catch {
+    return {};
+  }
+}
+
+function responseBodyCaptureEvidence({ isBlob, bodylessResponse, bodyCaptured, independentCapture, networkState }) {
+  if (isBlob) return { bodyCaptured: false, bodyCaptureComplete: true, bodyCaptureStatus: "referenced" };
+  if (bodylessResponse) return { bodyCaptured: false, bodyCaptureComplete: true, bodyCaptureStatus: "bodyless" };
+  if (!bodyCaptured) {
+    return {
+      bodyCaptured: false,
+      bodyCaptureComplete: false,
+      bodyCaptureStatus: "incomplete",
+      bodyCompletenessReason: "body-read-failed",
+    };
+  }
+  if (independentCapture || networkState === "finished") {
+    return { bodyCaptured: true, bodyCaptureComplete: true, bodyCaptureStatus: "complete" };
+  }
+  return {
+    bodyCaptured: true,
+    bodyCaptureComplete: false,
+    bodyCaptureStatus: "unknown",
+    bodyCompletenessReason: networkState === "failed" ? "request-failed" : "request-not-finished",
+  };
+}
+
+function captureComponent(options, state, component, status, fields = {}) {
+  state.components[component] = status;
+  if (["captured", "bodyless", "referenced", "delegated"].includes(status) && !state.savedComponents.includes(component)) {
+    state.savedComponents.push(component);
+  }
+  options.record("capture-component", {
+    ...state.context,
+    component,
+    status,
+    completedAt: new Date().toISOString(),
+    completedMonotonicMs: monotonicNow(),
+    ...fields,
+  });
+}
+
+function captureResponse(response, options, state) {
   const request = response.request();
-  const responseId = options.responseIdFor(request);
-  const frameId = options.frameIdForRequest(request);
+  const responseId = state.responseId;
   const url = safeUrl(response.url());
   const resourceType = request.resourceType();
   const fromServiceWorker = typeof response.fromServiceWorker === "function"
@@ -898,111 +1307,198 @@ async function captureResponse(response, options) {
   const isBlob = response.url().startsWith("blob:");
   const isMockResponse = options.mockResponseBodiesOrigin && fromServiceWorker &&
     new URL(response.url()).origin === options.mockResponseBodiesOrigin;
-  if (isMockResponse) {
-    options.record("mock-response-delegated", {
-      responseId,
-      method: request.method(),
-      url,
-      status: response.status(),
-    });
-    return;
-  }
   const context = {
-    responseId,
-    ...(frameId ? { frameId } : {}),
-    url,
-    method: request.method(),
+    ...state.context,
     status: response.status(),
     ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
   };
+  state.responseStatus = response.status();
+  state.fromServiceWorker = fromServiceWorker;
+  if (isMockResponse) {
+    state.components.responseHeaders = "delegated";
+    state.components.responseBody = "delegated";
+    options.record("mock-response-delegated", {
+      ...context,
+      responseId,
+      method: request.method(),
+      url,
+    });
+    return;
+  }
+
   const routedBodyPromise = options.responseBodies?.get(request);
-  const responseHeadersTask = routedBodyPromise
-    ? routedBodyPromise.then(capture => capture.ok ? capture.headers : {})
-    : collect("response headers", () => readHeaders(response), context, options.addFailure);
+  const headerHint = responseHeaderHint(response);
   const redirectResponse = context.status >= 300 && context.status <= 399;
   const bodylessResponse = request.method() === "HEAD" || [204, 304].includes(context.status) || redirectResponse;
   const bodylessReason = redirectResponse
     ? "Playwright does not expose response bodies for 3xx responses"
     : "HTTP response has no body";
-  const responseBodyTask = isBlob
-    ? Promise.resolve({ captureSource: "blob-source", blobId: createHash("sha256").update(response.url()).digest("hex") })
-    : bodylessResponse
-    ? Promise.resolve({ unavailable: true, reason: bodylessReason })
-    : routedBodyPromise
-    ? routedBodyPromise.then(capture => {
-        if (!capture.ok) return { captureError: capture.error, captureSource: "playwright-route-fetch" };
-        if (capture.status !== context.status) {
-          const error = new Error("Routed subscription response status did not match the browser response.");
-          options.addFailure({
-            kind: "diagnostic-collection",
-            operation: "verify routed subscription response",
-            ...context,
-            error: safeError(error),
-          });
-          return { captureError: error, captureSource: "playwright-route-fetch" };
-        }
-        return { bytes: capture.bytes, captureSource: "playwright-route-fetch" };
-      })
-    : collect(
-        "response body",
-        () => (typeof response.body === "function" ? response.body() : response.text()),
-        context,
-        options.addFailure
-      );
-  const [responseHeaders, responseBodyResult] = await Promise.all([responseHeadersTask, responseBodyTask]);
-  const responseBody = responseBodyResult?.captureError
-    ? undefined
-    : responseBodyResult?.bytes ?? responseBodyResult;
-  const serialized = responseBodyResult?.captureError
-    ? { body: { collection_error: [safeError(responseBodyResult.captureError)] }, bodyCaptured: false }
-    : await serializeResponseBody(responseBody, responseHeaders, context, options);
-  const requestHeaders = await collect(
-    "request headers",
-    () => readHeaders(request),
-    context,
-    options.addFailure
-  );
-  const requestData = await collect(
-    "request body",
-    () => requestBody(request, requestHeaders),
-    context,
-    options.addFailure
-  );
-  const bodyCaptureStatus = isBlob
-    ? "referenced"
-    : bodylessResponse
-    ? "bodyless"
-    : serialized.bodyCaptured
-    ? "complete"
-    : "incomplete";
-  const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
-  const item = {
-    responseId,
-    ...(frameId ? { frameId } : {}),
-    status: response.status(),
-    method: request.method(),
-    resourceType,
-    url,
-    requestHeaders: safeHeaders(requestHeaders),
-    headers: safeHeaders(responseHeaders),
-    requestBody: requestData,
-    body: serialized.body,
-    bodyCaptureComplete: bodylessResponse || serialized.bodyCaptured,
-    bodyCaptureStatus,
-    captureSource,
-    ...(context.fromServiceWorker !== undefined ? { fromServiceWorker: context.fromServiceWorker } : {}),
-  };
-  options.record("http", item);
-  if (response.status() >= 400) {
-    options.addFailure({
-      kind: "http",
-      responseId,
-      url,
-      method: request.method(),
-      resourceType,
-      status: response.status(),
+  let responseHeadersValue;
+  let responseBodySerialized;
+  let headersSettled = false;
+  let bodySettled = false;
+  let aggregateStarted = false;
+  let aggregateTracked;
+  const writeAggregate = () => {
+    if (!headersSettled || !bodySettled || aggregateStarted) return;
+    aggregateStarted = true;
+    const aggregateTask = Promise.all([
+      state.requestHeadersTask,
+      state.requestBodyTask,
+    ]).then(() => {
+      const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
+      const bodyEvidence = responseBodyCaptureEvidence({
+        isBlob,
+        bodylessResponse,
+        bodyCaptured: Boolean(responseBodySerialized?.bodyCaptured),
+        independentCapture: captureSource === "playwright-route-fetch",
+        networkState: state.networkState,
+      });
+      options.record("http", {
+        responseId,
+        ...(state.frameId ? { frameId: state.frameId } : {}),
+        status: context.status,
+        method: request.method(),
+        resourceType,
+        url,
+        requestHeaders: safeHeaders(state.requestHeadersValue),
+        headers: safeHeaders(responseHeadersValue),
+        requestBody: state.requestBodyValue,
+        body: responseBodySerialized?.body,
+        ...bodyEvidence,
+        captureSource,
+        ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
+      });
+      if (context.status >= 400) {
+        options.addFailure({
+          kind: "http",
+          responseId,
+          url,
+          method: request.method(),
+          resourceType,
+          status: context.status,
+        });
+      }
     });
+    aggregateTracked = trackPending(options.pending, "aggregate response record", aggregateTask, context, options.addFailure, {
+      evidenceSnapshot: state.snapshot,
+    });
+  };
+
+  state.components.responseHeaders = "pending";
+  const headerStartedAt = new Date().toISOString();
+  const headerStartedMonotonicMs = monotonicNow();
+  options.record("capture-component-started", {
+    ...context,
+    component: "responseHeaders",
+    startedAt: headerStartedAt,
+    startedMonotonicMs: headerStartedMonotonicMs,
+  });
+  const responseHeadersTask = (routedBodyPromise
+    ? routedBodyPromise.then(capture => capture.ok ? capture.headers : { collection_error: safeError(capture.error) })
+    : collect("response headers", () => readHeaders(response), context, options.addFailure)
+  ).then(headers => {
+    responseHeadersValue = headers;
+    headersSettled = true;
+    captureComponent(options, state, "responseHeaders", collectionStatus(headers), {
+      value: safeHeaders(headers),
+      startedAt: headerStartedAt,
+      elapsedMs: Math.max(0, Math.round(monotonicNow() - headerStartedMonotonicMs)),
+    });
+    writeAggregate();
+    return headers;
+  });
+  const responseHeadersTracked = trackPending(options.pending, "response headers capture", responseHeadersTask, context, options.addFailure, {
+    evidenceSnapshot: state.snapshot,
+  });
+
+  const bodyStartedAt = new Date().toISOString();
+  const bodyStartedMonotonicMs = monotonicNow();
+  options.record("capture-component-started", {
+    ...context,
+    component: "responseBody",
+    startedAt: bodyStartedAt,
+    startedMonotonicMs: bodyStartedMonotonicMs,
+  });
+  state.components.responseBody = "pending";
+  let responseBodyTask;
+  if (isBlob) {
+    responseBodyTask = Promise.resolve({
+      captureSource: "blob-source",
+      blobId: createHash("sha256").update(response.url()).digest("hex"),
+    });
+  } else if (bodylessResponse) {
+    responseBodyTask = Promise.resolve({ unavailable: true, reason: bodylessReason });
+  } else if (routedBodyPromise) {
+    responseBodyTask = routedBodyPromise.then(capture => {
+      if (!capture.ok) return { captureError: capture.error, captureSource: "playwright-route-fetch" };
+      if (capture.status !== context.status) {
+        const error = new Error("Routed subscription response status did not match the browser response.");
+        options.addFailure({
+          kind: "diagnostic-collection",
+          operation: "verify routed subscription response",
+          ...context,
+          error: safeError(error),
+        });
+        return { captureError: error, captureSource: "playwright-route-fetch" };
+      }
+      return { bytes: capture.bytes, captureSource: "playwright-route-fetch", headers: capture.headers };
+    });
+  } else {
+    responseBodyTask = collect(
+      "response body",
+      () => (typeof response.body === "function" ? response.body() : response.text()),
+      context,
+      options.addFailure
+    );
   }
+  responseBodyTask = responseBodyTask.then(async bodyResult => {
+    if (bodyResult?.captureError) {
+      responseBodySerialized = { body: { collection_error: safeError(bodyResult.captureError) }, bodyCaptured: false };
+    } else if (isBlob) {
+      responseBodySerialized = { body: bodyResult, bodyCaptured: true };
+    } else if (bodylessResponse) {
+      responseBodySerialized = { body: bodyResult, bodyCaptured: false };
+    } else if (isObject(bodyResult) && Object.hasOwn(bodyResult, "collection_error")) {
+      responseBodySerialized = { body: bodyResult, bodyCaptured: false };
+    } else {
+      const bodyBytes = bodyResult?.bytes ?? bodyResult;
+      const headersForSerialization = bodyResult?.headers ?? headerHint;
+      responseBodySerialized = await serializeResponseBody(bodyBytes, headersForSerialization, context, options);
+    }
+    bodySettled = true;
+    const status = isBlob ? "referenced" : bodylessResponse ? "bodyless" :
+      responseBodySerialized.bodyCaptured ? "captured" : "failed";
+    const captureSource = bodyResult?.captureSource ?? (routedBodyPromise ? "playwright-route-fetch" : isBlob ? "blob-source" : "playwright");
+    const bodyEvidence = responseBodyCaptureEvidence({
+      isBlob,
+      bodylessResponse,
+      bodyCaptured: Boolean(responseBodySerialized.bodyCaptured),
+      independentCapture: captureSource === "playwright-route-fetch",
+      networkState: state.networkState,
+    });
+    captureComponent(options, state, "responseBody", status, {
+      body: responseBodySerialized.body,
+      ...bodyEvidence,
+      captureSource,
+      startedAt: bodyStartedAt,
+      elapsedMs: Math.max(0, Math.round(monotonicNow() - bodyStartedMonotonicMs)),
+    });
+    writeAggregate();
+    return responseBodySerialized;
+  });
+  const responseBodyTracked = trackPending(options.pending, "response body capture", responseBodyTask, context, options.addFailure, {
+    evidenceSnapshot: state.snapshot,
+  });
+  const captureTask = Promise.allSettled([
+    responseHeadersTracked,
+    responseBodyTracked,
+    state.requestHeadersTask,
+    state.requestBodyTask,
+  ]).then(() => aggregateTracked?.catch(() => {}));
+  trackPending(options.pending, "response capture", captureTask, context, options.addFailure, {
+    evidenceSnapshot: state.snapshot,
+  });
 }
 
 async function captureConsole(message, options) {
@@ -1089,33 +1585,17 @@ async function captureConsole(message, options) {
   }
 }
 
-async function captureRequestFailure(request, options) {
-  const responseId = options.responseIdFor(request);
-  const frameId = options.frameIdForRequest(request);
-  const context = {
-    responseId,
-    ...(frameId ? { frameId } : {}),
-    url: safeUrl(request.url()),
-    method: request.method(),
-    resourceType: request.resourceType(),
-  };
-  const headers = await collect(
-    "failed request headers",
-    () => readHeaders(request),
-    context,
-    options.addFailure
-  );
-  const requestData = await collect(
-    "failed request body",
-    () => requestBody(request, headers),
-    context,
-    options.addFailure
-  );
+function captureRequestFailure(request, options, state) {
+  const error = safeText(request.failure()?.errorText ?? "unknown");
   const item = {
-    ...context,
-    requestHeaders: safeHeaders(headers),
-    requestBody: requestData,
-    error: safeText(request.failure()?.errorText ?? "unknown"),
+    ...state.context,
+    requestHeaders: state.requestHeadersReady
+      ? safeHeaders(state.requestHeadersValue)
+      : { captureStatus: state.components.requestHeaders },
+    requestBody: state.requestBodyReady
+      ? state.requestBodyValue
+      : { captureStatus: state.components.requestBody },
+    error,
   };
   options.record("requestfailed", item);
   options.addFailure({ kind: "requestfailed", ...item });
@@ -1129,14 +1609,24 @@ export function installPageDiagnostics(
   const recordEvent = (kind, item) => record(kind, { ...item, diagnosticOrder: ++diagnosticOrder });
   const addDiagnosticFailure = item => addFailure({ ...item, diagnosticOrder: ++diagnosticOrder });
   let binarySequence = 0;
+  let timelineSequence = 0;
   const requestIds = new WeakMap();
   const frameIds = new WeakMap();
   const requestFrameIds = new WeakMap();
+  const requestStates = new WeakMap();
   let requestSequence = 0;
   let frameSequence = 0;
+  const eventStamp = () => ({
+    timelineSequence: ++timelineSequence,
+    eventAt: new Date().toISOString(),
+    eventMonotonicMs: monotonicNow(),
+  });
+  const recordObserved = (kind, item) => recordEvent(kind, { ...eventStamp(), ...item });
   const options = {
     record: recordEvent,
+    recordObserved,
     addFailure: addDiagnosticFailure,
+    pending,
     binaryArtifactDir,
     mockResponseBodiesOrigin,
     responseBodies,
@@ -1169,6 +1659,104 @@ export function installPageDiagnostics(
       if (frameId) requestFrameIds.set(request, frameId);
       return frameId;
     },
+    requestStateFor(request) {
+      let state = requestStates.get(request);
+      if (state) return state;
+      const responseId = options.responseIdFor(request);
+      const frameId = options.frameIdForRequest(request);
+      const context = {
+        responseId,
+        ...(frameId ? { frameId } : {}),
+        url: safeUrl(request.url()),
+        method: request.method(),
+        resourceType: request.resourceType(),
+      };
+      state = {
+        responseId,
+        frameId,
+        context,
+        components: {
+          requestHeaders: "not-started",
+          requestBody: "not-started",
+          responseHeaders: "not-observed",
+          responseBody: "not-observed",
+        },
+        savedComponents: [],
+        networkState: "not-observed",
+        requestEvidenceStarted: false,
+        requestHeadersReady: false,
+        requestBodyReady: false,
+        snapshot: () => ({
+          responseId,
+          ...(frameId ? { frameId } : {}),
+          networkState: state.networkState,
+          components: { ...state.components },
+          savedComponents: [...state.savedComponents],
+        }),
+      };
+      requestStates.set(request, state);
+      return state;
+    },
+    ensureRequestEvidence(request, state = options.requestStateFor(request)) {
+      if (state.requestEvidenceStarted) return state;
+      state.requestEvidenceStarted = true;
+      const headersStartedAt = new Date().toISOString();
+      const headersStartedMonotonicMs = monotonicNow();
+      state.components.requestHeaders = "pending";
+      state.components.requestBody = "pending";
+      options.record("capture-component-started", {
+        ...state.context,
+        component: "requestHeaders",
+        startedAt: headersStartedAt,
+        startedMonotonicMs: headersStartedMonotonicMs,
+      });
+      const headersTask = collect(
+        "request headers",
+        () => readHeaders(request),
+        state.context,
+        options.addFailure,
+      ).then(headers => {
+        state.requestHeadersValue = headers;
+        state.requestHeadersReady = true;
+        captureComponent(options, state, "requestHeaders", collectionStatus(headers), {
+          value: safeHeaders(headers),
+          startedAt: headersStartedAt,
+          elapsedMs: Math.max(0, Math.round(monotonicNow() - headersStartedMonotonicMs)),
+        });
+        return headers;
+      });
+      state.requestHeadersTask = trackPending(pending, "request headers capture", headersTask, state.context, options.addFailure, {
+        evidenceSnapshot: state.snapshot,
+      });
+
+      const bodyStartedAt = new Date().toISOString();
+      const bodyStartedMonotonicMs = monotonicNow();
+      options.record("capture-component-started", {
+        ...state.context,
+        component: "requestBody",
+        startedAt: bodyStartedAt,
+        startedMonotonicMs: bodyStartedMonotonicMs,
+      });
+      const bodyTask = headersTask.then(headers => collect(
+        "request body",
+        () => requestBody(request, headers),
+        state.context,
+        options.addFailure,
+      )).then(body => {
+        state.requestBodyValue = body;
+        state.requestBodyReady = true;
+        captureComponent(options, state, "requestBody", collectionStatus(body), {
+          value: safeBody(body),
+          startedAt: bodyStartedAt,
+          elapsedMs: Math.max(0, Math.round(monotonicNow() - bodyStartedMonotonicMs)),
+        });
+        return body;
+      });
+      state.requestBodyTask = trackPending(pending, "request body capture", bodyTask, state.context, options.addFailure, {
+        evidenceSnapshot: state.snapshot,
+      });
+      return state;
+    },
   };
   const listeners = new Map();
   const listen = (event, listener) => {
@@ -1182,23 +1770,85 @@ export function installPageDiagnostics(
     options.addFailure({ kind: "pageerror", error: safeError(error) });
   });
   listen("crash", () => {
+    const event = eventStamp();
+    options.record("page-crash", {
+      ...event,
+      error: { name: "PageCrash", message: "The page crashed.", stack: "" },
+    });
     options.addFailure({
       kind: "page-crash",
       error: { name: "PageCrash", message: "The page crashed.", stack: "" },
+      ...event,
+    });
+  });
+  listen("close", () => {
+    options.record("page-close-event", eventStamp());
+  });
+  listen("frameattached", (frame) => {
+    options.recordObserved("frame-attached", {
+      frameId: options.frameIdFor(frame),
+      url: safeUrl(frame.url()),
+    });
+  });
+  listen("framenavigated", (frame) => {
+    let isMainFrame;
+    try { isMainFrame = page.mainFrame() === frame; } catch { isMainFrame = undefined; }
+    options.recordObserved("frame-navigated", {
+      frameId: options.frameIdFor(frame),
+      url: safeUrl(frame.url()),
+      ...(isMainFrame !== undefined ? { isMainFrame } : {}),
     });
   });
   listen("framedetached", (frame) => {
-    options.record("frame-detached", { frameId: options.frameIdFor(frame) });
+    options.recordObserved("frame-detached", { frameId: options.frameIdFor(frame) });
+  });
+  listen("request", (request) => {
+    try {
+      const state = options.requestStateFor(request);
+      const event = eventStamp();
+      if (!["finished", "failed"].includes(state.networkState)) state.networkState = "in-progress";
+      let redirectedFrom;
+      try {
+        const previous = request.redirectedFrom?.();
+        if (previous) redirectedFrom = options.responseIdFor(previous);
+      } catch { /* Redirect linkage is optional for requests without one. */ }
+      options.record("request-started", {
+        ...state.context,
+        ...event,
+        ...(redirectedFrom ? { redirectedFrom } : {}),
+      });
+      options.ensureRequestEvidence(request, state);
+    } catch (error) {
+      options.addFailure({
+        kind: "diagnostic-collection",
+        operation: "request metadata",
+        error: safeError(error),
+      });
+    }
+  });
+  listen("requestfinished", (request) => {
+    try {
+      const state = options.requestStateFor(request);
+      if (state.networkState !== "failed") state.networkState = "finished";
+      options.recordObserved("request-finished", state.context);
+    } catch (error) {
+      options.addFailure({
+        kind: "diagnostic-collection",
+        operation: "request completion metadata",
+        error: safeError(error),
+      });
+    }
   });
   listen("requestfailed", (request) => {
     try {
-      track(
-        pending,
-        "failed request capture",
-        captureRequestFailure(request, options),
-        { url: safeUrl(request.url()), method: request.method() },
-        options.addFailure
-      );
+      const state = options.requestStateFor(request);
+      options.ensureRequestEvidence(request, state);
+      state.networkState = "failed";
+      options.recordObserved("request-failed", {
+        ...state.context,
+        error: safeText(request.failure()?.errorText ?? "unknown"),
+      });
+      captureRequestFailure(request, options, state);
     } catch (error) {
       options.addFailure({
         kind: "diagnostic-collection",
@@ -1209,13 +1859,19 @@ export function installPageDiagnostics(
   });
   listen("response", (response) => {
     try {
-      track(
-        pending,
-        "response capture",
-        captureResponse(response, options),
-        { url: safeUrl(response.url()), method: response.request().method() },
-        options.addFailure
-      );
+      const request = response.request();
+      const state = options.requestStateFor(request);
+      options.ensureRequestEvidence(request, state);
+      if (!["finished", "failed"].includes(state.networkState)) state.networkState = "response-received";
+      const fromServiceWorker = typeof response.fromServiceWorker === "function"
+        ? response.fromServiceWorker()
+        : undefined;
+      options.recordObserved("response-received", {
+        ...state.context,
+        status: response.status(),
+        ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
+      });
+      captureResponse(response, options, state);
     } catch (error) {
       options.addFailure({
         kind: "diagnostic-collection",
@@ -1229,5 +1885,6 @@ export function installPageDiagnostics(
       page.off(event, listener);
     }
   };
+  removeListeners.recordLifecycle = (kind, item) => recordObserved(kind, item);
   return removeListeners;
 }

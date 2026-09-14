@@ -90,7 +90,13 @@ export const test = base.extend<DiagnosticFixtures>({
         if (drain) await drain(expectedCount);
       }, expectedMockResponses);
       trackPending(pending, "drain MSW mocked responses", mockDrain, {}, addFailure);
-      const teardown = await closeCapturedPage({ pending, removeDiagnostics, page });
+      const teardown = await closeCapturedPage({
+        pending,
+        removeDiagnostics,
+        page,
+        record,
+        recordLifecycle: removeDiagnostics.recordLifecycle,
+      });
       for (const { operation, error } of teardown.closeErrors) {
         const kind = operation === "close page" ? "page-close" :
           operation.startsWith("drain") ? "diagnostic-drain" : "diagnostic-collection";

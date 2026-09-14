@@ -21,6 +21,7 @@ import {
   safeError,
   safeText,
   safeUrl,
+  summarizeCaptureLifecycle,
 } from "../../tests/e2e/diagnostics.mjs";
 
 function fakePage() {
@@ -235,6 +236,21 @@ describe("browser diagnostics", () => {
       body: { captureSource: "blob-source", blobId: "other-source" },
     }, source])).toMatchObject([{ responseId: { requestId: "blob-response-2" } }]);
     expect(missingResponseBodies([response, response, source])).toEqual([]);
+    const componentOnly = {
+      kind: "capture-component",
+      responseId: { source: "playwright", requestId: "blob-component-only" },
+      component: "responseBody",
+      status: "referenced",
+      body: { captureSource: "blob-source", blobId: "missing-component-source" },
+    };
+    expect(missingResponseBodies([componentOnly])).toMatchObject([{
+      responseId: componentOnly.responseId,
+      captureSource: "blob-source",
+    }]);
+    expect(missingResponseBodies([componentOnly, {
+      kind: "blob-source",
+      blobId: "missing-component-source",
+    }])).toEqual([]);
   });
   it("flags each incomplete Playwright response by its own ID, even when tuples match", () => {
     const complete = {
@@ -251,13 +267,41 @@ describe("browser diagnostics", () => {
       ...complete,
       responseId: { source: "playwright", requestId: "request-b" },
       bodyCaptureComplete: false,
-      body: { collection_error: ["body unavailable"] },
+      bodyCaptured: true,
+      bodyCaptureStatus: "unknown",
+      body: { code: "bytes-with-unknown-completeness" },
     };
-    expect(missingResponseBodies([complete, incomplete])).toEqual([expect.objectContaining({
+    expect(missingResponseBodies([complete, {
+      kind: "request-finished",
+      responseId: complete.responseId,
+    }, incomplete, {
+      kind: "request-failed",
+      responseId: incomplete.responseId,
+    }])).toEqual([expect.objectContaining({
       responseId: incomplete.responseId,
       captureSource: "playwright",
+      bodyCaptureStatus: "unknown",
+      bodyCaptured: true,
+      body: { code: "bytes-with-unknown-completeness" },
     })]);
-    expect(missingResponseBodies([incomplete, complete])).toHaveLength(1);
+    expect(missingResponseBodies([incomplete, complete, {
+      kind: "request-finished",
+      responseId: complete.responseId,
+    }, {
+      kind: "request-failed",
+      responseId: incomplete.responseId,
+    }])).toHaveLength(1);
+    const failedRead = {
+      ...incomplete,
+      responseId: { source: "playwright", requestId: "request-c" },
+      bodyCaptureStatus: "incomplete",
+      bodyCaptured: false,
+      body: { collection_error: ["body unavailable"] },
+    };
+    expect(missingResponseBodies([failedRead, {
+      kind: "request-finished",
+      responseId: failedRead.responseId,
+    }])).toMatchObject([{ responseId: failedRead.responseId, bodyCaptureStatus: "incomplete" }]);
   });
   it("reconciles delegated MSW responses with captured bodies without merging identical requests", () => {
     const tuple = { method: "POST", url: "https://api.example.test/auth/token", status: 403 };
@@ -275,6 +319,11 @@ describe("browser diagnostics", () => {
       body: { code: "denied" },
     });
     const twoDelegated = [delegated("playwright-a"), delegated("playwright-b")];
+    expect(missingResponseBodies([
+      { ...delegated("playwright-a"), kind: "response-received" },
+      delegated("playwright-a"),
+      captured("msw-a"),
+    ])).toEqual([]);
     expect(missingResponseBodies([...twoDelegated, captured("msw-a")])).toEqual([
       expect.objectContaining({
         responseId: { source: "playwright", requestId: "playwright-a" },
@@ -311,6 +360,145 @@ describe("browser diagnostics", () => {
     };
     expect(missingResponseBodies([redirect])).toEqual([]);
   });
+  it("detects a response-body reader that never reaches an aggregate record", () => {
+    const responseId = { source: "playwright", requestId: "playwright-request-pending" };
+    const response = {
+      kind: "response-received",
+      responseId,
+      method: "GET",
+      url: "https://cdn.example.test/file",
+      status: 200,
+    };
+    expect(missingResponseBodies([response, {
+      kind: "capture-component-started",
+      responseId,
+      component: "responseBody",
+      startedAt: "2026-09-14T10:00:00.000Z",
+    }])).toEqual([expect.objectContaining({
+      responseId,
+      bodyCaptureStatus: "pending",
+      bodyCompletenessReason: "body-capture-pending",
+    })]);
+    expect(missingResponseBodies([response, {
+      kind: "capture-component",
+      responseId,
+      component: "responseBody",
+      status: "captured",
+      body: { message: "saved" },
+    }])).toEqual([expect.objectContaining({
+      responseId,
+      bodyCaptureStatus: "unknown",
+      bodyCompletenessReason: "request-not-finished",
+      bodyCaptured: true,
+      body: { message: "saved" },
+    })]);
+    expect(missingResponseBodies([response, {
+      kind: "capture-component",
+      responseId,
+      component: "responseBody",
+      status: "captured",
+      body: { message: "saved" },
+    }, {
+      kind: "request-finished",
+      responseId,
+    }])).toEqual([]);
+  });
+  it("does not call bytes from an aborted or unterminated request complete", () => {
+    const responseId = { source: "playwright", requestId: "playwright-request-aborted" };
+    const body = { result: "bytes-remain-available" };
+    const records = [
+      { kind: "response-received", responseId, status: 200, method: "GET", url: "https://checkout.example.test/poll" },
+      { kind: "capture-component", responseId, component: "responseBody", status: "captured", bodyCaptured: true, body },
+      { kind: "http", responseId, status: 200, method: "GET", url: "https://checkout.example.test/poll", captureSource: "playwright", bodyCaptureComplete: true, bodyCaptureStatus: "complete", body },
+      { kind: "request-failed", responseId, error: "net::ERR_ABORTED" },
+    ];
+
+    expect(missingResponseBodies(records)).toEqual([expect.objectContaining({
+      responseId,
+      bodyCaptureStatus: "unknown",
+      bodyCompletenessReason: "request-failed",
+      bodyCaptured: true,
+      body,
+    })]);
+    expect(summarizeCaptureLifecycle(records).requests[0]).toMatchObject({
+      responseBodyStatus: "unknown",
+      responseBodyCaptured: true,
+      responseBodyCompletenessReason: "request-failed",
+    });
+    expect(summarizeCaptureLifecycle([...records, { kind: "request-finished", responseId }])
+      .requests[0].responseBodyStatus).toBe("unknown");
+    expect(missingResponseBodies(records.filter(item => item.kind === "response-received" || item.kind === "request-failed")))
+      .toEqual([expect.objectContaining({
+        responseId,
+        bodyCaptureStatus: "incomplete",
+        bodyCompletenessReason: "request-failed",
+      })]);
+
+    const finishedBeforeBody = [
+      { kind: "request-finished", responseId },
+      ...records.filter(item => item.kind !== "request-failed"),
+    ];
+    const finishedAfterBody = [
+      ...records.filter(item => item.kind !== "request-failed"),
+      { kind: "request-finished", responseId },
+    ];
+    expect(missingResponseBodies(finishedBeforeBody)).toEqual([]);
+    expect(missingResponseBodies(finishedAfterBody)).toEqual([]);
+    expect(summarizeCaptureLifecycle(finishedAfterBody).requests[0].responseBodyStatus).toBe("complete");
+
+    const routeFetched = records.map(item => item.kind === "http"
+      ? { ...item, captureSource: "playwright-route-fetch" }
+      : item);
+    expect(missingResponseBodies(routeFetched)).toEqual([]);
+  });
+  it("summarizes lifecycle by exact request ID without copying response bodies", () => {
+    const first = { source: "playwright", requestId: "playwright-request-1" };
+    const second = { source: "playwright", requestId: "playwright-request-2" };
+    const delegated = { source: "playwright", requestId: "playwright-request-3" };
+    const summary = summarizeCaptureLifecycle([
+      { kind: "request-started", responseId: first, method: "GET", resourceType: "script", url: "https://cdn.example.test/js?token=private-token", timelineSequence: 1, eventAt: "2026-09-14T10:00:00.000Z", eventMonotonicMs: 1 },
+      { kind: "request-started", responseId: second, method: "GET", url: "https://cdn.example.test/js?token=private-token", timelineSequence: 2, eventAt: "2026-09-14T10:00:00.001Z", eventMonotonicMs: 2 },
+      { kind: "response-received", responseId: first, status: 200, resourceType: "script", fromServiceWorker: false, timelineSequence: 3, eventAt: "2026-09-14T10:00:00.010Z", eventMonotonicMs: 10 },
+      { kind: "capture-component-started", responseId: first, component: "responseBody", startedAt: "2026-09-14T10:00:00.010Z" },
+      { kind: "capture-component", responseId: first, component: "responseBody", status: "captured", captureSource: "playwright", body: { secret: "private-body" }, elapsedMs: 4, completedMonotonicMs: 14 },
+      { kind: "http", responseId: first, status: 200, resourceType: "script", captureSource: "playwright", bodyCaptureComplete: true, bodyCaptureStatus: "complete" },
+      { kind: "request-finished", responseId: first, timelineSequence: 7 },
+      { kind: "response-received", responseId: second, status: 200, timelineSequence: 4, eventAt: "2026-09-14T10:00:00.020Z", eventMonotonicMs: 20 },
+      { kind: "capture-component-started", responseId: second, component: "responseBody", startedAt: "2026-09-14T10:00:00.020Z" },
+      { kind: "failure", failureKind: "diagnostic-collection", responseId: second, operation: "response body", error: { message: "Protocol error: token=private-token" } },
+      { kind: "request-started", responseId: delegated, method: "POST", url: "https://api.example.test/auth/token", timelineSequence: 5, eventAt: "2026-09-14T10:00:00.030Z", eventMonotonicMs: 30 },
+      { kind: "response-received", responseId: delegated, status: 200, fromServiceWorker: true, timelineSequence: 6, eventAt: "2026-09-14T10:00:00.040Z", eventMonotonicMs: 40 },
+      { kind: "mock-response-delegated", responseId: delegated, method: "POST", url: "https://api.example.test/auth/token", status: 200 },
+      { kind: "http", responseId: { source: "msw", requestId: "msw-request-1" }, method: "POST", url: "https://api.example.test/auth/token", status: 200, captureSource: "msw-response:mocked", bodyCaptureComplete: true, body: { result: "private-mock-body" } },
+      { kind: "frame-detached", frameId: "playwright-frame-1", timelineSequence: 7, eventAt: "2026-09-14T10:00:05.000Z" },
+      { kind: "capture-shutdown", phase: "page-close-requested", pendingOperations: [{
+        operation: "response body capture",
+        responseId: second,
+        method: "GET",
+        url: "https://cdn.example.test/js?token=private-token",
+        elapsedMs: 5000,
+        evidence: { components: { responseBody: "pending" } },
+      }] },
+    ]);
+
+    expect(summary).toMatchObject({
+      requestCount: 3,
+      responseCount: 3,
+      requests: [
+        { requestId: first.requestId, responseBodyStatus: "complete", captureSource: "playwright", resourceType: "script", fromServiceWorker: false, httpRecord: true,
+          components: { responseBody: { status: "captured", completedMonotonicMs: 14 } } },
+        { requestId: second.requestId, responseBodyStatus: "pending", failures: [{ kind: "diagnostic-collection", operation: "response body", message: "Protocol error: token=[redacted]" }] },
+        { requestId: delegated.requestId, responseBodyStatus: "delegated", delegatedToMSW: true, captureSource: "msw-response:mocked" },
+      ],
+      frameEvents: [{ kind: "frame-detached", frameId: "playwright-frame-1" }],
+      mswResponses: [{ requestId: "msw-request-1", bodyCaptureComplete: true }],
+      pendingAtClose: [{ requestId: second.requestId, elapsedMs: 5000 }],
+    });
+    expect(summary.requests[0].events.map(event => event.timelineSequence)).toEqual([1, 3, 7]);
+    expect(JSON.stringify(summary)).not.toContain("private-token");
+    expect(JSON.stringify(summary)).not.toContain("private-body");
+    expect(JSON.stringify(summary)).not.toContain("private-mock-body");
+  });
   it("keeps same-tuple Playwright responses distinct and links each failure to its response", async () => {
     const page = fakePage();
     const observations = [];
@@ -336,6 +524,7 @@ describe("browser diagnostics", () => {
         allHeaders: async () => ({ "content-type": "application/json" }),
         body: async () => Buffer.from(JSON.stringify({ code })),
       });
+      page.emit("requestfinished", request);
     }
     await drainPending(pending);
 
@@ -347,6 +536,50 @@ describe("browser diagnostics", () => {
     expect(httpFailures.map(item => item.responseId).sort((a, b) => a.requestId.localeCompare(b.requestId)))
       .toEqual(responses.map(item => item.responseId).sort((a, b) => a.requestId.localeCompare(b.requestId)));
     expect(missingResponseBodies(observations)).toEqual([]);
+  });
+  it("does not borrow a finished request's status for another same-tuple body", async () => {
+    const page = fakePage();
+    const observations = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: () => {},
+    });
+    const requests = ["first-body", "second-body"].map(code => ({
+      code,
+      request: fakeRequest({
+        method: () => "GET",
+        url: () => "https://cdn.example.test/shared.js",
+        allHeaders: async () => ({}),
+        postData: () => null,
+      }),
+    }));
+    for (const { code, request } of requests) {
+      page.emit("response", {
+        request: () => request,
+        url: () => request.url(),
+        status: () => 200,
+        resourceType: () => "script",
+        allHeaders: async () => ({ "content-type": "application/json" }),
+        body: async () => Buffer.from(JSON.stringify({ code })),
+      });
+    }
+    page.emit("requestfinished", requests[0].request);
+    await drainPending(pending);
+
+    const responses = observations.filter(item => item.kind === "http");
+    expect(responses).toHaveLength(2);
+    expect(responses[0].responseId).not.toEqual(responses[1].responseId);
+    expect(responses.map(item => [item.body.code, item.bodyCaptureStatus])).toEqual([
+      ["first-body", "complete"],
+      ["second-body", "unknown"],
+    ]);
+    expect(missingResponseBodies(observations)).toEqual([expect.objectContaining({
+      responseId: responses[1].responseId,
+      bodyCaptureStatus: "unknown",
+      bodyCaptured: true,
+    })]);
   });
   it("marks a missing MSW response-body hook as incomplete capture", async () => {
     const page = fakePage();
@@ -385,7 +618,8 @@ describe("browser diagnostics", () => {
     page.emit("requestfailed", request);
     await drainPending(pending);
 
-    expect(observations.map(item => item.kind)).toEqual(["requestfailed"]);
+    expect(observations.filter(item => item.kind === "requestfailed")).toHaveLength(1);
+    expect(observations.find(item => item.kind === "request-failed").timelineSequence).toBeDefined();
     expect(failures).toMatchObject([{ kind: "requestfailed", responseId: { source: "playwright" } }]);
   });
   it("treats HEAD, 204, 304, and redirects as explicitly bodyless", async () => {
@@ -422,14 +656,14 @@ describe("browser diagnostics", () => {
     expect(missingResponseBodies(observations)).toEqual([]);
     expect(failures).toEqual([]);
   });
-  it("keeps third-party errors visible without making a verified live workflow fail", () => {
+  it("keeps third-party errors visible without failing a verified workflow, including Airwallex capture gaps", () => {
     const result = classifyLiveRun({
       requiredAssertions: ["checkout activates subscription"],
       assertions: [{ name: "checkout activates subscription", passed: true }],
       failures: [
         { kind: "http", url: "https://checkout.example.test/calculate", status: 403 },
         { kind: "console:error", location: { url: "https://checkout.example.test/sdk.js" } },
-        { kind: "diagnostic-collection", operation: "response body", url: "https://checkout.example.test/calculate" },
+        { kind: "diagnostic-collection", operation: "response body", url: "https://bws.sandbox.airwallex.com/bws/v1/payment" },
       ],
       cleanupStatus: "verified",
       firstPartyOrigins: ["https://app.example.test", "https://api.example.test"],
@@ -671,7 +905,8 @@ describe("browser diagnostics", () => {
     const request = fakeRequest({ allHeaders: async () => ({ "content-type": contentType }), postData: () => postData });
     page.emit("response", { request: () => request, url: request.url, status: () => 200, allHeaders: async () => ({}), text: async () => "ok" });
     await drainPending(pending);
-    expect(records[0].requestBody.fields ?? records[0].requestBody).toEqual([
+    const response = records.find(item => item.kind === "http");
+    expect(response.requestBody.fields ?? response.requestBody).toEqual([
       { name: "value", contents: "first" }, { name: "value", contents: "second" }, { name: "password", contents: "[redacted]" },
     ]);
     expect(failures).toEqual([]);
@@ -693,12 +928,14 @@ describe("browser diagnostics", () => {
       const result = await draining;
       expect(result[0].status).toBe("rejected");
       expect(result[0].reason.message).toContain("teardown window");
-      expect(result[0].reason.pendingOperations).toEqual([
+      expect(result[0].reason.pendingOperations).toMatchObject([
         {
           operation: "pending response body",
           index: 1,
           method: "GET",
           url: "https://api.example.test/subscriptions?sessionKey=[redacted]&mode=test",
+          startedAt: expect.any(String),
+          elapsedMs: 5000,
         },
       ]);
       expect(JSON.stringify(result[0].reason.pendingOperations)).not.toContain("private-session");
@@ -742,12 +979,151 @@ describe("browser diagnostics", () => {
     const teardown = closeCapturedPage({ pending, removeDiagnostics, page });
     await Promise.resolve();
     expect(pageClosed).toBe(false);
+    page.emit("requestfinished", request);
     finishBody(body);
     await teardown;
 
     expect(pageClosed).toBe(true);
     expect(observations.find(item => item.kind === "http").body).toEqual({ captured: true });
     expect(observations.find(item => item.kind === "http").bodyCaptureComplete).toBe(true);
+    expect(failures).toEqual([]);
+  });
+  it("saves request evidence before a hanging response-body read and snapshots it before close", async () => {
+    vi.useFakeTimers();
+    let rejectResponseBody;
+    let pageClosed = false;
+    const pending = [];
+    const observations = [];
+    const failures = [];
+    const page = Object.assign(fakePage(), {
+      close: async () => {
+        pageClosed = true;
+        rejectResponseBody(new Error("Target page, context or browser has been closed"));
+      },
+    });
+    const record = (kind, item) => observations.push({ kind, ...item });
+    const removeDiagnostics = installPageDiagnostics(page, {
+      pending,
+      record,
+      addFailure: failure => failures.push(failure),
+    });
+    const request = fakeRequest({
+      method: () => "GET",
+      allHeaders: async () => ({ "x-safe": "request-header" }),
+      postData: () => null,
+    });
+
+    try {
+      page.emit("request", request);
+      page.emit("response", {
+        request: () => request,
+        url: request.url,
+        status: () => 200,
+        allHeaders: async () => ({ "content-type": "application/json" }),
+        body: () => new Promise((resolve, reject) => { rejectResponseBody = reject; }),
+      });
+      page.emit("requestfinished", request);
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+      expect(observations).toContainEqual(expect.objectContaining({
+        kind: "capture-component",
+        component: "requestHeaders",
+        status: "captured",
+        value: { "x-safe": "request-header" },
+      }));
+      expect(observations).toContainEqual(expect.objectContaining({
+        kind: "capture-component",
+        component: "responseHeaders",
+        status: "captured",
+      }));
+      expect(observations.some(item => item.kind === "capture-component" && item.component === "responseBody"))
+        .toBe(false);
+
+      const timeline = observations.filter(item => [
+        "request-started", "response-received", "request-finished",
+      ].includes(item.kind));
+      expect(timeline.map(item => item.timelineSequence)).toEqual([1, 2, 3]);
+      expect(timeline.every(item => typeof item.eventAt === "string" && typeof item.eventMonotonicMs === "number"))
+        .toBe(true);
+      expect(timeline.every(item => item.responseId.requestId === timeline[0].responseId.requestId)).toBe(true);
+
+      const teardown = closeCapturedPage({ pending, removeDiagnostics, page, record });
+      await vi.advanceTimersByTimeAsync(5000);
+      const result = await teardown;
+      expect(pageClosed).toBe(true);
+      const preClose = observations.find(item => item.kind === "capture-shutdown" && item.phase === "page-close-requested");
+      const pendingBody = preClose.pendingOperations.find(item => item.operation === "response body capture");
+      expect(pendingBody.responseId).toEqual(timeline[0].responseId);
+      expect(pendingBody.startedAt).toEqual(expect.any(String));
+      expect(pendingBody.elapsedMs).toBeGreaterThanOrEqual(5000);
+      expect(pendingBody.evidence).toMatchObject({
+        networkState: "finished",
+        components: {
+          requestHeaders: "captured",
+          requestBody: "captured",
+          responseHeaders: "captured",
+          responseBody: "pending",
+        },
+        savedComponents: expect.arrayContaining([
+          "requestHeaders", "requestBody", "responseHeaders",
+        ]),
+      });
+      expect(JSON.stringify(preClose.pendingOperations)).not.toContain("secret-token");
+      expect(result.drainResults.some(item => item.status === "rejected")).toBe(true);
+      expect(failures).toContainEqual(expect.objectContaining({
+        operation: "response body",
+        error: expect.objectContaining({ message: "Target page, context or browser has been closed" }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("persists a completed response body while request-header capture is still pending", async () => {
+    let resolveRequestHeaders;
+    const pending = [];
+    const observations = [];
+    const failures = [];
+    const page = fakePage();
+    installPageDiagnostics(page, {
+      pending,
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: failure => failures.push(failure),
+    });
+    const request = fakeRequest({
+      method: () => "GET",
+      allHeaders: () => new Promise(resolve => { resolveRequestHeaders = resolve; }),
+      postData: () => null,
+    });
+    page.emit("request", request);
+    page.emit("response", {
+      request: () => request,
+      url: request.url,
+      status: () => 200,
+      headers: () => ({ "content-type": "application/json" }),
+      allHeaders: async () => ({ "content-type": "application/json" }),
+      body: async () => Buffer.from('{"result":"body-read-first"}'),
+    });
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+    const savedBody = observations.find(item => item.kind === "capture-component" &&
+      item.component === "responseBody");
+    expect(savedBody).toMatchObject({
+      status: "captured",
+      bodyCaptured: true,
+      bodyCaptureComplete: false,
+      bodyCaptureStatus: "unknown",
+      body: { result: "body-read-first" },
+    });
+    expect(observations.some(item => item.kind === "http")).toBe(false);
+
+    page.emit("requestfinished", request);
+    resolveRequestHeaders({ "x-safe": "headers-arrived-later" });
+    await drainPending(pending);
+    expect(observations.find(item => item.kind === "http")).toMatchObject({
+      body: { result: "body-read-first" },
+      bodyCaptureComplete: true,
+      requestHeaders: { "x-safe": "headers-arrived-later" },
+    });
     expect(failures).toEqual([]);
   });
   it("reports a rejected capture task only once across teardown drain phases", async () => {
@@ -761,6 +1137,23 @@ describe("browser diagnostics", () => {
     const rejected = teardown.drainResults.filter(result => result.status === "rejected");
     expect(rejected).toHaveLength(1);
     expect(rejected[0].reason.message).toBe("capture task failed");
+  });
+  it("records listener-removal and page-close failures as failed lifecycle phases", async () => {
+    const phases = [];
+    const teardown = await closeCapturedPage({
+      pending: [],
+      removeDiagnostics: async () => { throw new Error("listener removal failed"); },
+      page: { close: async () => { throw new Error("page close failed"); } },
+      record: (kind, item) => phases.push(item.phase),
+    });
+
+    expect(teardown.closeErrors.map(item => item.error.message)).toEqual([
+      "listener removal failed", "page close failed",
+    ]);
+    expect(phases).toContain("diagnostic-listener-removal-failed");
+    expect(phases).toContain("page-close-failed");
+    expect(phases).not.toContain("diagnostic-listeners-removed");
+    expect(phases).not.toContain("page-close-completed");
   });
   it("redacts credentials while retaining exception stacks", () => {
     const error = new Error("failed with https://api.stage.devneya.com?token=secret-token");
@@ -972,12 +1365,42 @@ describe("browser diagnostics", () => {
     });
     await Promise.all(pending);
 
-    expect(observations).toHaveLength(1);
-    expect(observations[0].requestHeaders.collection_error.message).toContain("request headers unavailable");
-    expect(observations[0].requestBody).toEqual({ password: "[redacted]", ok: true });
+    const response = observations.find(item => item.kind === "http");
+    expect(response.requestHeaders.collection_error.message).toContain("request headers unavailable");
+    expect(response.requestBody).toEqual({ password: "[redacted]", ok: true });
     expect(failures).toHaveLength(1);
     expect(failures[0].kind).toBe("diagnostic-collection");
     expect(JSON.stringify(failures)).not.toContain("secret-token");
+  });
+
+  it("reports an aggregate write failure once through its tracked task", async () => {
+    const page = fakePage();
+    const failures = [];
+    const pending = [];
+    installPageDiagnostics(page, {
+      pending,
+      record: kind => {
+        if (kind === "http") throw new Error("private trace append failed");
+      },
+      addFailure: failure => failures.push(failure),
+    });
+    const request = fakeRequest({ postData: () => null });
+
+    await page.emit("response", {
+      request: () => request,
+      url: request.url,
+      status: () => 200,
+      allHeaders: async () => ({ "content-type": "text/plain" }),
+      body: async () => Buffer.from("complete"),
+    });
+    await Promise.allSettled(pending);
+
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      kind: "diagnostic-collection",
+      operation: "aggregate response record",
+      error: { message: "private trace append failed" },
+    });
   });
 
   it("keeps top-level capture rejections visible to the drain", async () => {
@@ -1029,11 +1452,12 @@ describe("browser diagnostics", () => {
     });
     await Promise.all(pending);
 
-    expect(observations[0].body).toEqual({
+    const response = observations.find(item => item.kind === "http");
+    expect(response.body).toEqual({
       unavailable: true,
       reason: "Playwright does not expose response bodies for 3xx responses",
     });
-    expect(observations[0].headers.location).toBe("/login/");
+    expect(response.headers.location).toBe("/login/");
     expect(bodyRead).toBe(false);
     expect(failures).toHaveLength(0);
   });
@@ -1111,7 +1535,7 @@ describe("browser diagnostics", () => {
       });
       await Promise.all(pending);
 
-      const body = observations[0].body;
+      const body = observations.find(item => item.kind === "http").body;
       expect(body.binary).toBe(true);
       expect(body.byteLength).toBe(bytes.length);
       expect(await readFile(body.artifact)).toEqual(bytes);
@@ -1132,9 +1556,10 @@ describe("browser diagnostics", () => {
     const bytes = Buffer.from([0, 255, 128, 1]);
     page.emit("response", { request: () => request, url: request.url, status: () => 200, headersArray: async () => headers, body: async () => bytes });
     await drainPending(pending);
-    expect(records[0].headers).toEqual(headers);
-    expect(records[0].requestHeaders).toEqual(headers);
-    expect(Buffer.from(records[0].body.base64, "base64")).toEqual(bytes);
+    const response = records.find(item => item.kind === "http");
+    expect(response.headers).toEqual(headers);
+    expect(response.requestHeaders).toEqual(headers);
+    expect(Buffer.from(response.body.base64, "base64")).toEqual(bytes);
     expect(failures).toEqual([]);
   });
 
@@ -1154,12 +1579,12 @@ describe("browser diagnostics", () => {
     page.emit("response", { request: () => request, url: request.url, status: () => 200, fromServiceWorker: () => true, allHeaders: async () => ({}), text });
     await drainPending(pending);
     expect(text).not.toHaveBeenCalled();
-    expect(records).toMatchObject([{
+    expect(records.find(item => item.kind === "mock-response-delegated")).toMatchObject({
       kind: "mock-response-delegated",
       responseId: { source: "playwright" },
       method: "POST",
       status: 200,
-    }]);
+    });
     expect(JSON.stringify(records)).not.toContain("secret-token");
     captureMockResponse({
       kind: "response",
@@ -1172,13 +1597,11 @@ describe("browser diagnostics", () => {
       record: (kind, data) => records.push({ kind, ...data }),
       addFailure: failure => failures.push(failure),
     });
-    expect(records).toMatchObject([{
-      kind: "mock-response-delegated",
-    }, {
+    expect(records.find(item => item.kind === "http")).toMatchObject({
       kind: "http",
       responseId: { source: "msw", requestId: "msw-request-1" },
       body: { result: "complete" },
-    }]);
+    });
     expect(missingResponseBodies(records)).toEqual([]);
     expect(failures).toEqual([]);
   });
@@ -1206,7 +1629,7 @@ describe("browser diagnostics", () => {
     });
     await Promise.all(pending);
 
-    expect(observations[0].body).toEqual({ password: "[redacted]", ok: true });
+    expect(observations.find(item => item.kind === "http").body).toEqual({ password: "[redacted]", ok: true });
     expect(JSON.stringify(observations)).not.toContain("secret-password");
     expect(failures).toHaveLength(0);
   });
