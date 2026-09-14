@@ -16,6 +16,7 @@ export type SignUpResult = {
 
 type AuthContextValue = {
   session: Session | null;
+  passwordRecoveryPending: boolean;
   loading: boolean;
   initializationError: Error | null;
   signIn: (email: string, password: string) => Promise<void>;
@@ -65,13 +66,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [initializationError, setInitializationError] = useState<Error | null>(null);
+  const [passwordRecoveryPending, setPasswordRecoveryPending] = useState(false);
 
   useEffect(() => {
     let mounted = true;
+    let authStateChangeReceived = false;
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      if (event !== "INITIAL_SESSION") {
+        authStateChangeReceived = true;
+      }
+      if (!mounted) return;
+      if (event === "PASSWORD_RECOVERY" && nextSession) {
+        setPasswordRecoveryPending(true);
+      } else if (event === "SIGNED_OUT") {
+        setPasswordRecoveryPending(false);
+      }
+      setSession(nextSession);
+      if (nextSession) {
+        setInitializationError(null);
+      }
+      setLoading(false);
+    });
+
     supabase.auth
       .getSession()
       .then(({ data, error }) => {
-        if (!mounted) return;
+        if (!mounted || authStateChangeReceived) return;
         if (error) {
           setInitializationError(error);
         }
@@ -79,22 +101,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setLoading(false);
       })
       .catch((error: unknown) => {
-        if (!mounted) return;
+        if (!mounted || authStateChangeReceived) return;
         setInitializationError(
           error instanceof Error ? error : new Error("Session lookup failed", { cause: error })
         );
         setLoading(false);
       });
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession);
-      if (nextSession) {
-        setInitializationError(null);
-      }
-      setLoading(false);
-    });
 
     return () => {
       mounted = false;
@@ -204,6 +216,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       session,
+      passwordRecoveryPending,
       loading,
       initializationError,
       signIn,
@@ -218,6 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }),
     [
       session,
+      passwordRecoveryPending,
       loading,
       initializationError,
       signIn,

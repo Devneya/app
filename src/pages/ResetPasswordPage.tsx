@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
@@ -6,41 +6,21 @@ import { useAuth } from "@/auth/useAuth";
 import { logout } from "@/api/account";
 import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
-import { supabase } from "@/supabase";
 
 type PasswordStage = "none" | "password_changed" | "backend_logged_out";
 type ResetError = { cause: unknown; stage: PasswordStage };
 
 export function ResetPasswordPage() {
-  const { session, updatePassword, signOut } = useAuth();
+  const { session, passwordRecoveryPending, updatePassword, signOut } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [ready, setReady] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<ResetError | null>(null);
   const [done, setDone] = useState(false);
   const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
   const passwordLogoutTokenRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((event) => {
-      if (event === "PASSWORD_RECOVERY") {
-        if (active) {
-          setReady(true);
-        }
-      }
-    });
-
-    return () => {
-      active = false;
-      subscription.unsubscribe();
-    };
-  }, []);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -98,7 +78,7 @@ export function ResetPasswordPage() {
       title="Choose a new password"
       subtitle="Use at least 6 characters. Sign in again after saving."
     >
-      {!ready ? (
+      {!passwordRecoveryPending ? (
         <Stack spacing={2}>
           <Alert severity="info">
             Open the reset link from your email to continue. If the link expired, request a

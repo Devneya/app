@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Session, User } from "@supabase/supabase-js";
 import { AuthProvider, useAuthContext } from "@/auth/AuthProvider";
@@ -70,6 +70,52 @@ describe("AuthProvider response validation", () => {
       password: "password123",
       options: { emailRedirectTo: `${window.location.origin}/auth/confirm` },
     });
+  });
+
+  it("keeps a recovery event received before initial session lookup completes", async () => {
+    let finishSessionLookup!: (value: Awaited<ReturnType<typeof supabase.auth.getSession>>) => void;
+    vi.spyOn(supabase.auth, "getSession").mockReturnValue(
+      new Promise((resolve) => {
+        finishSessionLookup = resolve;
+      })
+    );
+    vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
+      queueMicrotask(() => callback("PASSWORD_RECOVERY", testSession));
+      return {
+        data: {
+          subscription: { id: "recovery-test", callback: vi.fn(), unsubscribe: vi.fn() },
+        },
+      };
+    });
+
+    const rendered = renderHook(() => useAuthContext(), {
+      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+    });
+    await waitFor(() => expect(rendered.result.current.passwordRecoveryPending).toBe(true));
+
+    await act(async () => {
+      finishSessionLookup({ data: { session: null }, error: null });
+    });
+    expect(rendered.result.current.passwordRecoveryPending).toBe(true);
+    expect(rendered.result.current.session).toBe(testSession);
+  });
+
+  it("keeps session lookup errors after the initial auth event", async () => {
+    const lookupError = new Error("Session lookup failed");
+    vi.spyOn(supabase.auth, "getSession").mockRejectedValueOnce(lookupError);
+    vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
+      queueMicrotask(() => callback("INITIAL_SESSION", null));
+      return {
+        data: {
+          subscription: { id: "initial-session-test", callback: vi.fn(), unsubscribe: vi.fn() },
+        },
+      };
+    });
+
+    const rendered = renderHook(() => useAuthContext(), {
+      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+    });
+    await waitFor(() => expect(rendered.result.current.initializationError).toBe(lookupError));
   });
 
   it("does not require confirmation when signup returns a session", async () => {
