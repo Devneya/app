@@ -16,6 +16,7 @@ import {
   classifyLiveRun,
   isAcceptedCaptureFailure,
   isConsoleCopyOfExpectedHttpFailure,
+  trackPending,
   safeBody,
   safeError,
   safeText,
@@ -619,6 +620,45 @@ describe("browser diagnostics", () => {
     expect(safeUrl("not a URL: retained details")).toBe("not a URL: retained details");
   });
 
+  it("retains and sanitizes special enumerable Error properties", () => {
+    const error = new Error("request failed");
+    Object.defineProperty(error, "__proto__", {
+      value: { status: 502, sessionKey: "private-session" },
+      enumerable: true,
+    });
+
+    const safe = safeError(error);
+
+    expect(Object.hasOwn(safe, "__proto__")).toBe(true);
+    expect(safe.__proto__).toEqual({ status: 502, sessionKey: "[redacted]" });
+    expect(Object.getPrototypeOf(safe)).toBe(Object.prototype);
+    expect(JSON.stringify(safe)).not.toContain("private-session");
+  });
+
+  it("redacts sensitive URLs used as object keys without dropping collisions", () => {
+    const firstUrl = "https://provider.example.test/collect?sessionKey=private-first&mode=test";
+    const secondUrl = "https://provider.example.test/collect?sessionKey=private-second&mode=test";
+    const safe = safeBody({ [firstUrl]: { status: 200 }, [secondUrl]: { status: 403 } });
+    const keys = Object.keys(safe);
+
+    expect(keys).toHaveLength(2);
+    expect(keys.every(key => key.includes("sessionKey=[redacted]&mode=test"))).toBe(true);
+    expect(Object.values(safe)).toEqual([{ status: 200 }, { status: 403 }]);
+    expect(safeBody(safe)).toEqual(safe);
+    expect(JSON.stringify(safe)).not.toContain("private-first");
+    expect(JSON.stringify(safe)).not.toContain("private-second");
+  });
+
+  it("preserves __proto__ as an enumerable diagnostic property", () => {
+    const input = JSON.parse('{"__proto__":{"status":"kept","sessionKey":"private-session"}}');
+    const safe = safeBody(input);
+
+    expect(Object.getPrototypeOf(safe)).toBe(Object.prototype);
+    expect(Object.keys(safe)).toEqual(["__proto__"]);
+    expect(safe.__proto__).toEqual({ status: "kept", sessionKey: "[redacted]" });
+    expect(JSON.stringify(safe)).toBe('{"__proto__":{"status":"kept","sessionKey":"[redacted]"}}');
+  });
+
   it.each([
     ["application/x-www-form-urlencoded", "value=first&value=second&password=private-credential"],
     ["multipart/form-data; boundary=test-boundary", "--test-boundary\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\nfirst\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\nsecond\r\n--test-boundary\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nprivate-credential\r\n--test-boundary--\r\n"],
@@ -637,18 +677,36 @@ describe("browser diagnostics", () => {
     expect(failures).toEqual([]);
   });
 
-  it("reports an unfinished teardown read without blocking page closure", async () => {
+  it("names unfinished teardown reads and retains their late failures", async () => {
     vi.useFakeTimers();
-    let finish;
-    const pending = [new Promise(resolve => { finish = resolve; })];
+    let rejectPending;
+    const pending = [];
+    const failures = [];
+    trackPending(pending, "completed response body", Promise.resolve(), {}, failure => failures.push(failure));
+    trackPending(pending, "pending response body", new Promise((resolve, reject) => { rejectPending = reject; }), {
+      method: "GET",
+      url: "https://api.example.test/subscriptions?sessionKey=private-session&mode=test",
+    }, failure => failures.push(failure));
     try {
       const draining = drainBeforeClose(pending);
       await vi.advanceTimersByTimeAsync(5000);
       const result = await draining;
       expect(result[0].status).toBe("rejected");
       expect(result[0].reason.message).toContain("teardown window");
-      finish();
-      expect((await drainPending(pending))[0].status).toBe("fulfilled");
+      expect(result[0].reason.pendingOperations).toEqual([
+        {
+          operation: "pending response body",
+          index: 1,
+          method: "GET",
+          url: "https://api.example.test/subscriptions?sessionKey=[redacted]&mode=test",
+        },
+      ]);
+      expect(JSON.stringify(result[0].reason.pendingOperations)).not.toContain("private-session");
+      rejectPending(new Error("late reader failure"));
+      expect((await drainPending(pending)).map(item => item.status)).toEqual(["fulfilled", "rejected"]);
+      expect(failures).toMatchObject([
+        { operation: "pending response body", error: { message: "late reader failure" } },
+      ]);
     } finally {
       vi.useRealTimers();
     }
@@ -715,7 +773,7 @@ describe("browser diagnostics", () => {
     expect(output).not.toContain("secret-password");
     expect(safeUrl("https://test.checkout.dodopayments.com/opaqueCheckout")).not.toContain("opaqueCheckout");
     expect(safeText('"forterToken":"private-fraud-token"')).not.toContain("private-fraud-token");
-    expect(safeBody({ forterToken: "private-fraud-token", sessionId: "cks_private-session" })).toEqual({ forterToken: "[redacted]", sessionId: "[redacted-capability]" });
+    expect(safeBody({ forterToken: "private-fraud-token", sessionId: "cks_private-session" })).toEqual({ forterToken: "[redacted]", sessionId: "[redacted]" });
     const basic = safeText("Authorization: Basic dXNlcjpzZWNyZXQ=");
     expect(basic).toContain("[redacted]");
     expect(basic).not.toContain("dXNlcjpzZWNyZXQ=");
@@ -731,6 +789,72 @@ describe("browser diagnostics", () => {
     expect(safeUrl("https://s3.amazonaws.com/bucket/object?X-Amz-Signature=secret-signature&part=1")).not.toContain("secret-signature");
     const body = safeBody({ value: 12, token_count: 3, checkout: { status: "open" }, payment_id: "pmt_456", api_key: "secret-key" });
     expect(body).toMatchObject({ value: 12, token_count: 3, checkout: { status: "open" }, payment_id: "pmt_456", api_key: "[redacted]" });
+  });
+
+  it("redacts camel-case credentials in captured JSON bodies and URL queries", () => {
+    const credentials = {
+      projectKey: "private-project-key",
+      sessionKey: "private-session-key",
+      deviceToken: "private-device-token",
+      sessionId: "private-session-id",
+      nonce: "private-nonce",
+      privateValue: "private-value",
+    };
+    const body = safeBody(credentials);
+    const bodyText = safeText(JSON.stringify(credentials));
+    const diagnosticText = safeText("projectKey=private-project-key sessionKey: private-session-key deviceToken=private-device-token sessionId=private-session-id nonce=private-nonce privateValue=private-value");
+    const url = safeUrl("https://provider.example.test/collect?sessionKey=private-session-key&deviceToken=private-device-token&sessionId=private-session-id&nonce=private-nonce&privateValue=private-value&event=kept");
+
+    expect(body).toEqual({
+      projectKey: "[redacted]",
+      sessionKey: "[redacted]",
+      deviceToken: "[redacted]",
+      sessionId: "[redacted]",
+      nonce: "[redacted]",
+      privateValue: "[redacted]",
+    });
+    expect(bodyText).toBe(JSON.stringify(body));
+    expect(diagnosticText).toBe("projectKey=[redacted] sessionKey: [redacted] deviceToken=[redacted] sessionId=[redacted] nonce=[redacted] privateValue=[redacted]");
+    expect(url).toContain("event=kept");
+    for (const value of Object.values(credentials)) {
+      expect(JSON.stringify({ body, bodyText, diagnosticText, url })).not.toContain(value);
+    }
+  });
+
+  it("redacts every supported camel-case secret key", () => {
+    const keys = [
+      "password", "secret", "authorization", "cookie", "apiKey", "clientSecret",
+      "privateKey", "secretKey", "token", "accessToken", "refreshToken", "idToken",
+      "oauthToken", "deviceToken", "forterToken", "paymentToken", "sessionKey",
+      "sessionToken", "sessionId", "projectKey", "checkoutUrl", "checkoutLink",
+      "portalUrl", "portalLink", "paymentLink", "signature", "sig", "email",
+      "cardNumber", "cvv", "cvc", "nonce", "privateValue",
+    ];
+    const credentials = Object.fromEntries(keys.map(key => [key, `sentinel-${key}`]));
+    const body = safeBody(credentials);
+    const text = safeText(keys.map(key => `${key}=sentinel-${key}`).join(" "));
+    const query = safeUrl(`https://provider.example.test/collect?${keys.map(key => `${encodeURIComponent(key)}=${encodeURIComponent(`sentinel-${key}`)}`).join("&")}`);
+
+    expect(Object.values(body)).toEqual(keys.map(() => "[redacted]"));
+    for (const key of keys) {
+      const sentinel = `sentinel-${key}`;
+      expect(text).not.toContain(sentinel);
+      expect(query).not.toContain(sentinel);
+    }
+  });
+
+  it("redacts URL query secrets without treating the scheme as a field", () => {
+    const url = "https://sdk-v2.custom.hs.dodopayments.com/1.1.0/checkout.html?publishableKey=private-publishable&clientSecret=private-client&mode=test";
+    for (const scrubUrls of [true, false]) {
+      const safe = safeText(url, scrubUrls);
+      expect(safe).not.toContain("private-publishable");
+      expect(safe).not.toContain("private-client");
+      const query = new URL(safe).searchParams;
+      expect(query.get("publishableKey")).toBe("[redacted]");
+      expect(query.get("clientSecret")).toBe("[redacted]");
+      expect(query.get("mode")).toBe("test");
+      expect(safeText(safe, scrubUrls)).toBe(safe);
+    }
   });
 
   it("captures successful auth responses, all console output, request headers, and failed requests", async () => {

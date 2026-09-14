@@ -7,7 +7,6 @@ import { createTheme } from "@mui/material/styles";
 export const brand = {
   ink: "#201d1d",
   canvas: "#fdfcfc",
-  paper: "#fdfcfc",
   soft: "#f4f2f2",
   muted: "#9a9898",
   hairline: "rgba(15, 0, 0, 0.12)",
@@ -55,7 +54,7 @@ export const theme = createTheme({
     },
     background: {
       default: brand.canvas,
-      paper: brand.paper,
+      paper: brand.canvas,
     },
     divider: brand.hairline,
   },

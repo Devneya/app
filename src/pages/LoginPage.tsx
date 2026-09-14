@@ -122,7 +122,9 @@ export function LoginPage() {
             <Alert severity="success">Password updated. Sign in with your new password.</Alert>
           ) : null}
           {initializationError ? (
-            <Alert severity="error">Could not load your session: {initializationError.message}</Alert>
+            <Alert severity="error">
+              Could not load your session: {describeError(initializationError, "Authentication session is temporarily unavailable.")}
+            </Alert>
           ) : null}
           {error ? (
             <Alert severity="error">{describeError(error.cause, "Authentication failed")}</Alert>

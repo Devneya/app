@@ -12,6 +12,7 @@ import {
   isAcceptedCaptureFailure,
   safeBody,
   safeError,
+  trackPending,
 } from "./diagnostics.mjs";
 
 type DiagnosticFixtures = {
@@ -88,12 +89,7 @@ export const test = base.extend<DiagnosticFixtures>({
         }).__devneyaDrainMockResponses;
         if (drain) await drain(expectedCount);
       }, expectedMockResponses);
-      pending.push(mockDrain);
-      mockDrain.catch((error) => addFailure({
-        kind: "diagnostic-collection",
-        operation: "drain MSW mocked responses",
-        error: safeError(error),
-      }));
+      trackPending(pending, "drain MSW mocked responses", mockDrain, {}, addFailure);
       const teardown = await closeCapturedPage({ pending, removeDiagnostics, page });
       for (const { operation, error } of teardown.closeErrors) {
         const kind = operation === "close page" ? "page-close" :

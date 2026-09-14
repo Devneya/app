@@ -7,7 +7,23 @@ import { installConsoleCapture } from "./console-capture.mjs";
 import { installBlobCapture } from "./blob-capture.mjs";
 
 const SENSITIVE_KEY =
-  /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|x-(?:amz|goog)-[\w-]+|card[_-]?number|cvv|cvc|email)(?:$|[_-])/i;
+  /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|nonce|session[_-]?id|private[_-]?value|x[_-](?:amz|goog)[_-][\w-]+|card[_-]?number|cvv|cvc|email)(?:$|[_-])/i;
+
+function normalizedKey(value) {
+  return String(value).replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/-/g, "_").toLowerCase();
+}
+
+function isSensitiveKey(value) {
+  return SENSITIVE_KEY.test(normalizedKey(value));
+}
+
+function redactSensitiveAssignments(value) {
+  return value.replace(
+    /(["']?)([A-Za-z][A-Za-z0-9_-]*)(["']?)(\s*[:=]\s*)(?!\/\/)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\[(?:redacted(?:-[^\]\s]+)?|omitted)\]|[^\s,;}&\]#]+)/g,
+    (match, prefix, key, suffix, separator) =>
+      isSensitiveKey(key) ? `${prefix}${key}${suffix}${separator}[redacted]` : match,
+  );
+}
 
 function isObject(value) {
   return typeof value === "object" && value !== null;
@@ -38,10 +54,12 @@ function safeUrlPath(pathname) {
 }
 
 function safeUrlQuery(url) {
-  const sensitive =
-    /^(?:password|secret|authorization|cookie|api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|code|state|nonce|signature|sig|x-(?:amz|goog)-[^=]+|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|card|cvv|cvc|email)$/i;
   return [...url.searchParams]
-    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(sensitive.test(key) ? "[redacted]" : safeText(value))}`)
+    .map(([key, value]) => {
+      const normalized = normalizedKey(key);
+      const sensitive = isSensitiveKey(normalized) || /^(?:code|state|nonce)$/i.test(normalized);
+      return `${encodeURIComponent(key)}=${encodeURIComponent(sensitive ? "[redacted]" : safeText(value))}`;
+    })
     .join("&");
 }
 
@@ -79,11 +97,18 @@ export function safeUrl(value) {
 }
 
 export function safeText(value, scrubUrls = true) {
-  return String(value)
+  const text = String(value);
+  if (/^\s*(?:\{|\[)/.test(text)) {
+    try {
+      const parsed = JSON.parse(text);
+      if (isObject(parsed)) return JSON.stringify(safeBody(parsed));
+    } catch { /* Preserve non-JSON diagnostic text and apply the text rules below. */ }
+  }
+  const sanitized = text
     .replace(/\{[^{}]*\}/g, (fragment) => {
       try {
         const descriptor = JSON.parse(fragment);
-        if (typeof descriptor.name === "string" && SENSITIVE_KEY.test(descriptor.name) && "value" in descriptor) {
+        if (typeof descriptor.name === "string" && isSensitiveKey(descriptor.name) && "value" in descriptor) {
           return JSON.stringify({ ...descriptor, value: "[redacted]" });
         }
       } catch { /* Not a JSON descriptor; the text rules below still apply. */ }
@@ -114,9 +139,10 @@ export function safeText(value, scrubUrls = true) {
       '$1"[redacted]"'
     )
     .replace(
-      /(\b(?:password|secret|authorization|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|client[_-]?secret|key|email|card|cvv|cvc|[\w-]+[_-](?:password|secret|token|key))\b\s*[:=]\s*["']?)[^\s,;"'}]+/gi,
+      /(\b(?:password|secret|authorization|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|client[_-]?secret|key|email|card|cvv|cvc|[\w-]+[_-](?:password|secret|token|key))\b\s*[:=]\s*["']?)(?:\[(?:redacted(?:-[^\]\s]+)?|omitted)\]|[^\s,;"'}&#]+)/gi,
       "$1[redacted]"
     );
+  return redactSensitiveAssignments(sanitized);
 }
 
 export function safeError(error, seen = new WeakSet()) {
@@ -138,8 +164,11 @@ export function safeError(error, seen = new WeakSet()) {
         : { message: safeText(error.cause) };
     }
     for (const [key, value] of Object.entries(error)) {
-      if (key === "cause" || key in output) continue;
-      output[key] = SENSITIVE_KEY.test(key) ? "[redacted]" : safeBody(value, seen);
+      if (key === "cause" || Object.hasOwn(output, key)) continue;
+      Object.defineProperty(output, key, {
+        value: isSensitiveKey(key) ? "[redacted]" : safeBody(value, seen),
+        enumerable: true,
+      });
     }
     return output;
     } finally {
@@ -165,11 +194,21 @@ export function safeBody(value, seen = new WeakSet()) {
   if (Array.isArray(value)) return value.map((item) => safeBody(item, seen));
   const output = {};
   for (const [key, item] of Object.entries(value)) {
+    const safeKey = safeText(key);
+    let outputKey = safeKey;
+    let duplicate = 2;
+    while (Object.hasOwn(output, outputKey)) outputKey = `${safeKey} [duplicate ${duplicate++}]`;
     const credentialValue = key.toLowerCase() === "value" &&
-      typeof value.name === "string" && SENSITIVE_KEY.test(value.name);
-    output[key] = SENSITIVE_KEY.test(key) || /token$/i.test(key) || credentialValue
+      typeof value.name === "string" && isSensitiveKey(value.name);
+    const safeValue = isSensitiveKey(key) || /token$/i.test(normalizedKey(key)) || credentialValue
       ? "[redacted]"
       : safeBody(item, seen);
+    Object.defineProperty(output, outputKey, {
+      value: safeValue,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return output;
   } finally {
@@ -219,7 +258,7 @@ async function requestBody(request, requestHeaders) {
           contents = { base64: bytes.toString("base64"), byteLength: bytes.byteLength };
         }
         fields.push({ name, filename: safeText(value.name), contentType: value.type,
-          contents: SENSITIVE_KEY.test(name) ? "[redacted]" : contents });
+          contents: isSensitiveKey(name) ? "[redacted]" : contents });
       }
     }
     return { multipart: true, fields };
@@ -258,8 +297,16 @@ async function collect(label, read, context, addFailure) {
   }
 }
 
-function track(pending, operation, task, context, addFailure) {
+const pendingTaskDetails = new WeakMap();
+
+export function trackPending(pending, operation, task, context, addFailure) {
   const tracked = Promise.resolve(task);
+  const details = { operation, context: safeBody(context ?? {}), settled: false };
+  pendingTaskDetails.set(tracked, details);
+  tracked.then(
+    () => { details.settled = true; },
+    () => { details.settled = true; },
+  );
   tracked.catch((error) => {
     addFailure({
       kind: "diagnostic-collection",
@@ -271,6 +318,8 @@ function track(pending, operation, task, context, addFailure) {
   pending.push(tracked);
   return tracked;
 }
+
+const track = trackPending;
 
 export async function drainPending(pending) {
   const settled = [];
@@ -387,7 +436,10 @@ export async function installSubscribeResponseCapture(
         }
       }
     })();
-    pending.push(captureTask);
+    trackPending(pending, "subscription response route", captureTask, {
+      url: safeUrl(request.url()),
+      method: request.method(),
+    }, addFailure);
     await captureTask;
   };
   const routeMatcher = url => matches(url);
@@ -411,7 +463,19 @@ export async function drainBeforeClose(pending) {
       new Promise(resolve => {
         timer = globalThis.setTimeout(() => resolve([{
           status: "rejected",
-          reason: new Error("Browser capture exceeded the five-second teardown window; close the page and retain remaining reader errors."),
+          reason: Object.assign(
+            new Error("Browser capture exceeded the five-second teardown window; close the page and retain remaining reader errors."),
+            {
+              pendingOperations: pending.flatMap((task, index) => {
+                const details = pendingTaskDetails.get(task);
+                return !details || details.settled ? [] : [{
+                  operation: details.operation,
+                  index,
+                  ...details.context,
+                }];
+              }),
+            },
+          ),
         }]), 5000);
       }),
     ]);

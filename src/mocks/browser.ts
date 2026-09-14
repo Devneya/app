@@ -39,7 +39,7 @@ const captureMockedResponse = (event: MockResponseEvent) => {
     url: event.request.url,
     status: event.response.status,
   };
-  const capture = Promise.resolve().then(async () => {
+  const capture = (async () => {
     try {
       const body = event.response.body === null ? "" : await event.response.clone().text();
       return await hook({
@@ -57,7 +57,7 @@ const captureMockedResponse = (event: MockResponseEvent) => {
           : { name: "Error", message: String(error), stack: "" },
       });
     }
-  });
+  })();
   pendingMockResponseCaptures.add(capture);
 };
 

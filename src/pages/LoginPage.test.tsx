@@ -14,6 +14,18 @@ describe("LoginPage", () => {
     expect(screen.getByRole("link", { name: /forgot password/i })).toBeInTheDocument();
   });
 
+  it("formats session initialization errors for display", async () => {
+    vi.spyOn(supabase.auth, "getSession").mockRejectedValueOnce(
+      new Error('{"message":"Session lookup failed."}')
+    );
+    renderApp("/login");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load your session: Session lookup failed."
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent('{"message":');
+  });
+
   it("shows error on invalid credentials", async () => {
     renderApp("/login");
     const user = userEvent.setup();
