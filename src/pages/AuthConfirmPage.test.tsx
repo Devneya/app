@@ -12,6 +12,7 @@ function HistoryBack() {
 }
 
 function mockAuthSubscription() {
+  vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
   vi.spyOn(supabase.auth, "onAuthStateChange").mockReturnValue({
     data: {
       subscription: { id: "test-subscription", callback: vi.fn(), unsubscribe: vi.fn() },
@@ -20,6 +21,7 @@ function mockAuthSubscription() {
 }
 
 function mockAuthSession(session: Session | null) {
+  vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
   vi.spyOn(supabase.auth, "getSession").mockResolvedValue({
     data: { session },
     error: null,

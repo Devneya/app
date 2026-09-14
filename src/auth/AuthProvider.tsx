@@ -90,23 +90,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setLoading(false);
     });
 
-    supabase.auth
-      .getSession()
-      .then(({ data, error }) => {
+    void (async () => {
+      try {
+        const { error: initializationError } = await supabase.auth.initialize();
+        if (initializationError) throw initializationError;
+        if (authStateChangeReceived) return;
+
+        const { data, error } = await supabase.auth.getSession();
         if (!mounted || authStateChangeReceived) return;
         if (error) {
           setInitializationError(error);
         }
         setSession(data.session);
         setLoading(false);
-      })
-      .catch((error: unknown) => {
+      } catch (error: unknown) {
         if (!mounted || authStateChangeReceived) return;
         setInitializationError(
           error instanceof Error ? error : new Error("Session lookup failed", { cause: error })
         );
         setLoading(false);
-      });
+      }
+    })();
 
     return () => {
       mounted = false;

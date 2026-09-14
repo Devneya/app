@@ -17,5 +17,7 @@ export const supabase = createClient(config.apiBaseUrl, config.gotrueAnonKey, {
     // GoTrue confirmation / recovery links redirect with tokens in the URL hash.
     flowType: "implicit",
     detectSessionInUrl: true,
+    // Let AuthProvider subscribe before URL/session recovery emits its one-time event.
+    skipAutoInitialize: true,
   },
 });

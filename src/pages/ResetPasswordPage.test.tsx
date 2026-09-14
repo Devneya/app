@@ -23,6 +23,7 @@ function renderPage() {
 
 describe("ResetPasswordPage", () => {
   beforeEach(() => {
+    vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
     vi.spyOn(supabase.auth, "getSession").mockResolvedValue({
       data: { session: testSession },
       error: null,

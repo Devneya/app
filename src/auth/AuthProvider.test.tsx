@@ -36,6 +36,7 @@ async function renderAuth(initialSession: Session | null = null) {
   vi.spyOn(supabase.auth, "getSession").mockResolvedValue(
     sessionResponse as Awaited<ReturnType<typeof supabase.auth.getSession>>
   );
+  vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
   vi.spyOn(supabase.auth, "onAuthStateChange").mockReturnValue({
     data: {
       subscription: { id: "test-subscription", callback: vi.fn(), unsubscribe: vi.fn() },
@@ -72,6 +73,38 @@ describe("AuthProvider response validation", () => {
     });
   });
 
+  it("subscribes before initialization and retains a recovery event emitted during initialization", async () => {
+    const order: string[] = [];
+    let authStateCallback: Parameters<typeof supabase.auth.onAuthStateChange>[0] | undefined;
+    const getSession = vi.spyOn(supabase.auth, "getSession").mockResolvedValue({
+      data: { session: null },
+      error: null,
+    } as Awaited<ReturnType<typeof supabase.auth.getSession>>);
+    vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
+      order.push("subscribe");
+      authStateCallback = callback;
+      return {
+        data: {
+          subscription: { id: "recovery-init-test", callback: vi.fn(), unsubscribe: vi.fn() },
+        },
+      };
+    });
+    vi.spyOn(supabase.auth, "initialize").mockImplementation(async () => {
+      order.push("initialize");
+      authStateCallback?.("PASSWORD_RECOVERY", testSession);
+      return { error: null };
+    });
+
+    const rendered = renderHook(() => useAuthContext(), {
+      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+    });
+
+    await waitFor(() => expect(rendered.result.current.passwordRecoveryPending).toBe(true));
+    expect(order).toEqual(["subscribe", "initialize"]);
+    expect(getSession).not.toHaveBeenCalled();
+    expect(rendered.result.current.session).toBe(testSession);
+  });
+
   it("keeps a recovery event received before initial session lookup completes", async () => {
     let finishSessionLookup!: (value: Awaited<ReturnType<typeof supabase.auth.getSession>>) => void;
     vi.spyOn(supabase.auth, "getSession").mockReturnValue(
@@ -79,8 +112,10 @@ describe("AuthProvider response validation", () => {
         finishSessionLookup = resolve;
       })
     );
+    vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
+    let authStateCallback: Parameters<typeof supabase.auth.onAuthStateChange>[0] | undefined;
     vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
-      queueMicrotask(() => callback("PASSWORD_RECOVERY", testSession));
+      authStateCallback = callback;
       return {
         data: {
           subscription: { id: "recovery-test", callback: vi.fn(), unsubscribe: vi.fn() },
@@ -91,6 +126,9 @@ describe("AuthProvider response validation", () => {
     const rendered = renderHook(() => useAuthContext(), {
       wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
     });
+    await waitFor(() => expect(supabase.auth.getSession).toHaveBeenCalledOnce());
+
+    act(() => authStateCallback?.("PASSWORD_RECOVERY", testSession));
     await waitFor(() => expect(rendered.result.current.passwordRecoveryPending).toBe(true));
 
     await act(async () => {
@@ -103,6 +141,7 @@ describe("AuthProvider response validation", () => {
   it("keeps session lookup errors after the initial auth event", async () => {
     const lookupError = new Error("Session lookup failed");
     vi.spyOn(supabase.auth, "getSession").mockRejectedValueOnce(lookupError);
+    vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
     vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
       queueMicrotask(() => callback("INITIAL_SESSION", null));
       return {
@@ -116,6 +155,27 @@ describe("AuthProvider response validation", () => {
       wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
     });
     await waitFor(() => expect(rendered.result.current.initializationError).toBe(lookupError));
+  });
+
+  it("surfaces initialization errors reported after an initial session event", async () => {
+    const initializationError = new Error("Session initialization failed");
+    const getSession = vi.spyOn(supabase.auth, "getSession");
+    vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: initializationError as never });
+    vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation((callback) => {
+      queueMicrotask(() => callback("INITIAL_SESSION", null));
+      return {
+        data: {
+          subscription: { id: "initialization-error-test", callback: vi.fn(), unsubscribe: vi.fn() },
+        },
+      };
+    });
+
+    const rendered = renderHook(() => useAuthContext(), {
+      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+    });
+
+    await waitFor(() => expect(rendered.result.current.initializationError).toBe(initializationError));
+    expect(getSession).not.toHaveBeenCalled();
   });
 
   it("does not require confirmation when signup returns a session", async () => {
