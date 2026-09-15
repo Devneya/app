@@ -25,7 +25,7 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run test -- --reporter=default --reporter=junit --outputFile.junit=unit-results.xml
+      - run: npm run test -- --reporter=default --reporter=junit --reporter=./src/test/no-skipped-tests-reporter.mjs --outputFile.junit=unit-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
