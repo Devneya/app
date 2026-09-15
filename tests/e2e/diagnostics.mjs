@@ -668,36 +668,24 @@ export function isConsoleCopyOfExpectedHttpFailure(failure, failures = [], expec
     other?.kind === "http" && other.url === failure.location.url && expectedHttpFailure(other));
 }
 
-function diagnosticSourceOrigins(failure) {
-  const values = [];
-  const add = value => {
-    if (typeof value === "string" && value) values.push(value);
-  };
-  add(failure?.url);
-  add(failure?.context?.url);
-  add(failure?.response?.url);
-  add(failure?.location?.url);
-  add(failure?.consoleOrigin);
-  add(failure?.text);
-  const addError = error => {
-    if (!error || typeof error !== "object") return;
-    add(error.message);
-    add(error.stack);
-    for (const operation of error.pendingOperations ?? []) add(operation?.url);
-  };
-  addError(failure?.error);
-  for (const error of failure?.errors ?? []) addError(error);
-  const origins = new Set();
-  for (const value of values) {
-    for (const match of value.matchAll(/https?:\/\/[^\s"'<>`\\)\]}]+/gi)) {
-      try {
-        origins.add(new URL(match[0].replace(/[.,;:!?]+$/, "")).origin);
-      } catch {
-        // A malformed URL in a diagnostic is not source attribution.
-      }
-    }
+function isIdentifiedExternalDrain(failure, firstPartyOrigins) {
+  if (failure?.kind !== "diagnostic-drain" || !Array.isArray(failure.errors) || failure.errors.length === 0) {
+    return false;
   }
-  return origins;
+  const pendingOperations = [];
+  for (const error of failure.errors) {
+    if (!error || typeof error !== "object" || !Array.isArray(error.pendingOperations) ||
+        error.pendingOperations.length === 0) return false;
+    pendingOperations.push(...error.pendingOperations);
+  }
+  return pendingOperations.length > 0 && pendingOperations.every(operation => {
+    if (!operation || typeof operation.url !== "string") return false;
+    try {
+      return !firstPartyOrigins.has(new URL(operation.url).origin);
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function classifyLiveRun({
@@ -752,10 +740,8 @@ export function classifyLiveRun({
     }
     if (kind === "diagnostic-collection" || kind === "diagnostic-drain") captureIncomplete = true;
     let sourceOrigin;
-    const observedOrigins = diagnosticSourceOrigins(failure);
     if (kind?.startsWith("console:")) {
-      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url" ||
-          failure.consoleOriginSource === "page-context") {
+      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url") {
         try {
           sourceOrigin = new URL(failure.consoleOrigin).origin;
         } catch {
@@ -778,10 +764,7 @@ export function classifyLiveRun({
         }
       }
     }
-    const allObservedOriginsAreThirdParty = observedOrigins.size > 0 &&
-      [...observedOrigins].every(origin => !origins.has(origin));
-    if ((sourceOrigin && !origins.has(sourceOrigin)) ||
-        (!sourceOrigin && allObservedOriginsAreThirdParty)) {
+    if ((sourceOrigin && !origins.has(sourceOrigin)) || isIdentifiedExternalDrain(failure, origins)) {
       thirdPartyDiagnostics.push(failure);
     } else {
       blockingFailures.push(failure);
@@ -1044,14 +1027,6 @@ function captureResponse(response, options, state) {
 
 async function captureConsole(message, options) {
   const location = safeBody(message.location());
-  let pageContextOrigin;
-  try {
-    const ownerPage = typeof message.page === "function" ? message.page() : undefined;
-    const pageUrl = ownerPage && typeof ownerPage.url === "function" ? ownerPage.url() : "";
-    if (pageUrl) pageContextOrigin = new URL(pageUrl).origin;
-  } catch {
-    pageContextOrigin = undefined;
-  }
   const item = {
     type: message.type(),
     text: safeText(message.text()),
@@ -1113,10 +1088,6 @@ async function captureConsole(message, options) {
       } catch {
         item.consoleOriginSource = "unknown";
       }
-    }
-    if (item.consoleOriginSource === "unknown" && pageContextOrigin) {
-      item.consoleOrigin = pageContextOrigin;
-      item.consoleOriginSource = "page-context";
     }
   } else {
     item.consoleOriginSource = "not-required";

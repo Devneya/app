@@ -4,6 +4,7 @@ import {
   classifyLiveRun,
   drainBeforeClose,
   isAcceptedCaptureFailure,
+  installPageDiagnostics,
   missingResponseBodies,
   safeBody,
   safeError,
@@ -143,47 +144,94 @@ describe("browser diagnostics", () => {
     ])).toBe(false);
   });
 
-  it("attributes a detached third-party console error from its retained URL", () => {
+  it("keeps an unknown console source blocking even when its text names an external URL", () => {
+    const failure = {
+      kind: "console:error",
+      text: "Error loading iframe from https://static.sandbox.airwallex.com/frame.js",
+      consoleOriginSource: "unknown",
+    };
     const result = classifyLiveRun({
-      failures: [{
-        kind: "diagnostic-collection",
-        operation: "console document origin",
-        text: "Error loading iframe from https://static.sandbox.airwallex.com/frame.js",
-        consoleOriginSource: "unknown",
-        error: { message: "Frame was detached" },
-      }, {
-        kind: "console:error",
-        text: "Error loading iframe from https://static.sandbox.airwallex.com/frame.js",
-        consoleOriginSource: "unknown",
-      }],
+      failures: [failure],
       firstPartyOrigins: ["https://api.stage.devneya.com"],
       cleanupStatus: "verified",
     });
-    expect(result.workflowStatus).toBe("passed");
-    expect(result.captureStatus).toBe("incomplete");
-    expect(result.blockingFailures).toEqual([]);
-    expect(result.thirdPartyDiagnostics).toHaveLength(2);
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.captureStatus).toBe("complete");
+    expect(result.blockingFailures).toEqual([failure]);
+    expect(result.thirdPartyDiagnostics).toEqual([]);
   });
 
-  it("uses the owning page origin when a console frame has already detached", () => {
-    const result = classifyLiveRun({
-      failures: [{
+  it("keeps console context-read failures unknown instead of using the enclosing page", async () => {
+    const listeners = new Map();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    const page = {
+      on(event, listener) { listeners.set(event, listener); },
+      off() {},
+    };
+    installPageDiagnostics(page, {
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+      pending,
+    });
+    const message = {
+      type: () => "error",
+      text: () => "Failed to submit form; see https://test.checkout.dodopayments.com/help",
+      location: () => ({ url: "https://test.checkout.dodopayments.com/checkout" }),
+      args: () => { throw new Error("Execution context was destroyed"); },
+    };
+    listeners.get("console")(message);
+    await Promise.allSettled(pending);
+
+    expect(observations).toEqual([expect.objectContaining({
+      kind: "console",
+      consoleOriginSource: "unknown",
+    })]);
+    expect(observations[0].consoleOrigin).toBeUndefined();
+    expect(failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({
         kind: "diagnostic-collection",
-        operation: "console document origin",
-        text: "Failed to submit form: status 403",
-        consoleOrigin: "https://test.checkout.dodopayments.com",
-        consoleOriginSource: "page-context",
-        error: { message: "Execution context was destroyed" },
-      }],
+        consoleOriginSource: "unknown",
+      }),
+      expect.objectContaining({
+        kind: "console:error",
+        consoleOriginSource: "unknown",
+      }),
+    ]));
+  });
+
+  it("keeps first-party console attribution blocking even when text names an external URL", () => {
+    const failure = {
+      kind: "console:error",
+      text: "First-party failure while loading https://external.example.test/frame.js",
+      consoleOrigin: "https://api.stage.devneya.com",
+      consoleOriginSource: "document-context",
+    };
+    const result = classifyLiveRun({
+      failures: [failure],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.blockingFailures).toEqual([failure]);
+    expect(result.thirdPartyDiagnostics).toEqual([]);
+  });
+
+  it("retains trusted external console attribution", () => {
+    const failure = {
+      kind: "console:error",
+      text: "External checkout error",
+      consoleOrigin: "https://test.checkout.dodopayments.com",
+      consoleOriginSource: "document-context",
+    };
+    const result = classifyLiveRun({
+      failures: [failure],
       firstPartyOrigins: ["https://api.stage.devneya.com"],
       cleanupStatus: "verified",
     });
     expect(result.workflowStatus).toBe("passed");
-    expect(result.captureStatus).toBe("incomplete");
-    expect(result.blockingFailures).toEqual([]);
-    expect(result.thirdPartyDiagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ consoleOriginSource: "page-context" }),
-    ]));
+    expect(result.thirdPartyDiagnostics).toEqual([failure]);
   });
 
   it("attributes a third-party teardown timeout only from its pending URL", () => {
@@ -219,6 +267,24 @@ describe("browser diagnostics", () => {
     expect(result.workflowStatus).toBe("failed");
     expect(result.captureStatus).toBe("incomplete");
     expect(result.blockingFailures).toEqual([firstParty, sourceLess]);
+    expect(result.thirdPartyDiagnostics).toEqual([]);
+  });
+
+  it("keeps a mixed external and unidentified teardown group blocking", () => {
+    const failure = {
+      kind: "diagnostic-drain",
+      errors: [
+        { pendingOperations: [{ url: "https://captcha.example.test/logo.png" }] },
+        { message: "capture timeout" },
+      ],
+    };
+    const result = classifyLiveRun({
+      failures: [failure],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.blockingFailures).toEqual([failure]);
     expect(result.thirdPartyDiagnostics).toEqual([]);
   });
 
