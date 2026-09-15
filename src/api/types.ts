@@ -1,5 +1,5 @@
 export const subscriptionStatuses = [
-  "none", "pending", "active", "past_due", "cancelled", "expired", "review_required",
+  "none", "active", "past_due", "cancelled", "expired", "review_required",
 ] as const;
 export type SubscriptionStatus = (typeof subscriptionStatuses)[number];
 
@@ -10,7 +10,6 @@ export const billingActions = [
 export type UsageResponse = {
   used: number;
   limit: number;
-  subscription_status: SubscriptionStatus;
   entitlement_status: SubscriptionStatus;
   cancel_at_period_end: boolean;
   access_until: string | null;
@@ -30,17 +29,5 @@ export type CancelSubscriptionResponse = {
 };
 
 export type KeyResponse = {
-  key: string;
-};
-
-export type ModelObject = {
-  id: string;
-  object: string;
-  created: number;
-  owned_by: string;
-};
-
-export type ModelsListResponse = {
-  object: string;
-  data: ModelObject[];
+  key: string | null;
 };

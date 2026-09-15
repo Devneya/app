@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -20,7 +20,6 @@ import {
   uncancelSubscription,
 } from "@/api/account";
 import { describeError } from "@/api/errors";
-import { fetchModels } from "@/api/models";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
@@ -73,11 +72,6 @@ export function InferencePage() {
     enabled: Boolean(token),
   });
 
-  const modelsQuery = useQuery({
-    queryKey: ["models"],
-    queryFn: fetchModels,
-  });
-
   const subscribeMutation = useMutation({
     mutationFn: () => startSubscription(token),
     onSuccess: (data) => {
@@ -103,16 +97,24 @@ export function InferencePage() {
   });
 
   const usage = usageQuery.data;
+  const keyValue = keyQuery.data?.key;
+  const refetchKey = keyQuery.refetch;
+
+  useEffect(() => {
+    if (usage?.entitlement_status !== "none" && keyValue === null) {
+      void refetchKey();
+    }
+  }, [keyValue, refetchKey, usage?.entitlement_status]);
+
   const usagePercent =
     usage && usage.limit > 0 ? Math.min(100, (usage.used / usage.limit) * 100) : 0;
-  const models = modelsQuery.data?.data ?? [];
   const status = usage?.entitlement_status;
   const billingAction = usage?.required_billing_action;
   const accessUntil = usage?.access_until;
   const cancelScheduled = billingAction === "uncancel";
 
   async function copyKey() {
-    if (!keyQuery.data?.key) {
+    if (!keyValue) {
       return;
     }
     setCopyError(null);
@@ -121,7 +123,7 @@ export function InferencePage() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(keyQuery.data.key);
+      await navigator.clipboard.writeText(keyValue);
     } catch (error) {
       setCopyError({ cause: error });
     }
@@ -161,7 +163,7 @@ export function InferencePage() {
               <Alert severity="error">
                 {describeError(keyQuery.error, "Could not load API key")}
               </Alert>
-            ) : (
+            ) : keyQuery.data?.key ? (
               <Stack
                 direction={{ xs: "column", sm: "row" }}
                 spacing={2}
@@ -189,6 +191,10 @@ export function InferencePage() {
                   Copy
                 </Button>
               </Stack>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                Your API key will appear after the first verified payment.
+              </Typography>
             )}
           </Section>
 
@@ -280,9 +286,6 @@ export function InferencePage() {
                     </Button>
                   ) : null}
                 </Stack>
-                {status === "pending" ? (
-                  <Alert severity="info">Payment confirmation is pending.</Alert>
-                ) : null}
                 {billingAction === "contact_support" ? (
                   <Alert severity="warning">Billing requires support review.</Alert>
                 ) : null}
@@ -290,47 +293,6 @@ export function InferencePage() {
             )}
           </Section>
 
-          <Section title="Available models">
-            {modelsQuery.isLoading ? (
-              <LinearProgress aria-label="Loading models" />
-            ) : modelsQuery.error ? (
-              <Alert severity="error">
-                {describeError(modelsQuery.error, "Could not load models")}
-              </Alert>
-            ) : models.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                No models available right now.
-              </Typography>
-            ) : (
-              <Box
-                component="ul"
-                aria-label="Available models"
-                sx={{
-                  m: 0,
-                  pl: 0,
-                  listStyle: "none",
-                  borderTop: `1px solid ${brand.hairline}`,
-                }}
-              >
-                {models.map((model) => (
-                  <Box
-                    component="li"
-                    key={model.id}
-                    sx={{
-                      py: 1.25,
-                      borderBottom: `1px solid ${brand.hairline}`,
-                      fontFamily: "inherit",
-                      fontSize: "0.875rem",
-                    }}
-                  >
-                    <Typography component="code" sx={{ fontSize: "0.875rem" }}>
-                      {model.id}
-                    </Typography>
-                  </Box>
-                ))}
-              </Box>
-            )}
-          </Section>
         </Stack>
       </Container>
     </>

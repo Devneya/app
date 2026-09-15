@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { MOCK_USER, MOCK_VIRTUAL_KEY, test } from "../fixtures";
+import { MOCK_USER, test } from "../fixtures";
 
 test.describe("auth flow", () => {
   test("login page snapshot", async ({ page }) => {
@@ -35,9 +35,8 @@ test.describe("auth flow", () => {
 
     await expect(page.getByText("[Devneya]")).toBeVisible();
     await expect(page.getByRole("link", { name: "LLM inference" })).toBeVisible();
-    await expect(page.getByText(MOCK_VIRTUAL_KEY)).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Available models" })).toBeVisible();
-    await expect(page.getByRole("list", { name: "Available models" })).toBeVisible();
+    await expect(page.getByText(/API key will appear after the first verified payment/i)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Usage & subscription" })).toBeVisible();
     await expect(
       page.getByRole("button", { name: new RegExp(`Account menu: ${MOCK_USER.email}`, "i") })
     ).toBeVisible();

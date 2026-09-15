@@ -1,7 +1,7 @@
 import { readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test as base } from "@playwright/test";
-import { MOCK_USER, MOCK_VIRTUAL_KEY } from "../../src/mocks/data";
+import { MOCK_USER } from "../../src/mocks/data";
 import {
   installPageDiagnostics,
   closeCapturedPage,
@@ -40,7 +40,7 @@ export const test = base.extend<DiagnosticFixtures>({
       const recordMockedResponse = (payload: unknown) => captureMockResponse(payload, { record, addFailure });
       let testFailure: unknown;
       try {
-        const configuration = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir });
+        const configuration = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir, captureBlobs: false });
         record("diagnostic-config", configuration);
       } catch (error) {
         const failure = {
@@ -222,4 +222,4 @@ export const test = base.extend<DiagnosticFixtures>({
   ],
 });
 
-export { MOCK_USER, MOCK_VIRTUAL_KEY };
+export { MOCK_USER };

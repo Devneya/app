@@ -12,9 +12,6 @@ export const MOCK_VIRTUAL_KEY =
 export const MOCK_CHECKOUT_URL =
   "https://checkout.dodopayments.com/session/mock-checkout-session";
 
-/** Client-facing model aliases — same shape as GET /llm/v1/models. */
-export const MOCK_MODELS = ["gpt-oss-20b", "llama-3.3-70b", "qwen3-32b"] as const;
-
 export type MockSession = {
   accessToken: string;
   subscribed: boolean;

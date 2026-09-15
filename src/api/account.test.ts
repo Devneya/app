@@ -28,6 +28,12 @@ describe("account API response checks", () => {
     });
   });
 
+  it("accepts a missing key before verified payment", async () => {
+    server.use(http.get(`${accountBase}/key`, () => HttpResponse.json({ key: null })));
+
+    await expect(fetchVirtualKey(MOCK_ACCESS_TOKEN)).resolves.toEqual({ key: null });
+  });
+
   it("preserves supported response fields beyond the fields validated by the client", async () => {
     server.use(
       http.get(`${accountBase}/key`, () =>
@@ -37,7 +43,6 @@ describe("account API response checks", () => {
         HttpResponse.json({
           used: 1,
           limit: 10,
-          subscription_status: "active",
           entitlement_status: "active",
           cancel_at_period_end: false,
           access_until: null,
@@ -108,7 +113,6 @@ describe("account API response checks", () => {
         HttpResponse.json({
           used: 0,
           limit: 10,
-          subscription_status: "none",
           entitlement_status: "none",
           cancel_at_period_end: false,
           required_billing_action: "subscribe",

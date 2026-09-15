@@ -337,7 +337,7 @@ export function trackPending(pending, operation, task, context, addFailure, { ev
     addFailure({
       kind: "diagnostic-collection",
       operation,
-      ...context,
+      ...safeBody(context ?? {}),
       error: safeError(error),
     });
   });
@@ -364,7 +364,7 @@ export async function drainPending(pending) {
 
 export async function configurePageCapture(
   page,
-  { record, addFailure, pending = [], binaryArtifactDir } = {},
+  { record, addFailure, pending = [], binaryArtifactDir, captureBlobs = false } = {},
 ) {
   await installConsoleCapture(page, payload => {
     const safe = safeBody(payload);
@@ -373,21 +373,25 @@ export async function configurePageCapture(
       addFailure({ kind: "diagnostic-collection", operation: "console source snapshot", ...safe });
     }
   });
-  let blobSequence = 0;
-  await installBlobCapture(page, payload => track(pending, "blob source capture", (async () => {
-    if (payload.error) {
-      addFailure({ kind: "diagnostic-collection", operation: "blob source capture", url: safeUrl(payload.url), error: safeBody(payload.error) });
-      return;
-    }
-    const serialized = await serializeResponseBody(Buffer.from(payload.base64, "base64"),
-      { "content-type": payload.contentType }, { url: safeUrl(payload.url) }, {
-        binaryArtifactDir, binaryPrefix: "blob-source", nextBinaryArtifact: () => ++blobSequence, addFailure,
-      });
-    record("blob-source", { blobId: createHash("sha256").update(payload.url).digest("hex"),
-      url: safeUrl(payload.url), contentType: payload.contentType, body: serialized.body });
-  })(), { url: safeUrl(payload.url) }, addFailure));
+  if (captureBlobs) {
+    let blobSequence = 0;
+    await installBlobCapture(page, payload => track(pending, "blob source capture", (async () => {
+      if (payload.error) {
+        addFailure({ kind: "diagnostic-collection", operation: "blob source capture", url: safeUrl(payload.url), error: safeBody(payload.error) });
+        return;
+      }
+      const serialized = await serializeResponseBody(Buffer.from(payload.base64, "base64"),
+        { "content-type": payload.contentType }, { url: safeUrl(payload.url) }, {
+          binaryArtifactDir, binaryPrefix: "blob-source", nextBinaryArtifact: () => ++blobSequence, addFailure,
+        });
+      record("blob-source", { blobId: createHash("sha256").update(payload.url).digest("hex"),
+        url: safeUrl(payload.url), contentType: payload.contentType, body: serialized.body });
+    })(), { url: safeUrl(payload.url) }, addFailure));
+  }
   return {
-    responseBodyCapture: "Playwright response bodies; MSW owns mocked bodies; blob bytes captured at creation",
+    responseBodyCapture: captureBlobs
+      ? "Playwright response bodies; MSW owns mocked bodies; blob bytes captured at creation"
+      : "Playwright response bodies; MSW owns mocked bodies",
   };
 }
 
@@ -623,110 +627,20 @@ export function captureMockResponse(payload, { record, addFailure }) {
     ...context,
     headers: safeBody(data.headers),
     body,
-    bodyCaptureComplete: true,
+    bodyCaptureStatus: "complete",
     fromServiceWorker: true,
     captureSource: "msw-response:mocked",
   });
 }
 
-function reconcilePlaywrightResponseBodies(observations) {
-  const requests = new Map();
-  for (const item of observations) {
-    const requestId = item?.responseId?.source === "playwright" ? item.responseId.requestId : undefined;
-    if (typeof requestId !== "string") continue;
-    let evidence = requests.get(requestId);
-    if (!evidence) {
-      evidence = {
-        requestId,
-        responseSeen: false,
-        bodyCaptured: false,
-        bodyless: false,
-        referenced: false,
-        delegated: false,
-        bodyReadFailed: false,
-        bodyPending: false,
-        requestFinished: false,
-        requestFailed: false,
-      };
-      requests.set(requestId, evidence);
-    }
-
-    if (item.kind === "request-finished" || item.kind === "request-failed") {
-      evidence.requestFinished ||= item.kind === "request-finished";
-      evidence.requestFailed ||= item.kind === "request-failed";
-    } else if (item.kind === "response-received") {
-      evidence.responseSeen = true;
-    } else if (item.kind === "capture-component-started" && item.component === "responseBody") {
-      evidence.responseSeen = true;
-      evidence.bodyPending = true;
-    } else if (item.kind === "capture-component" && item.component === "responseBody") {
-      evidence.responseSeen = true;
-      evidence.bodyCaptured ||= item.bodyCaptured === true || item.status === "captured";
-      evidence.bodyless ||= item.status === "bodyless" || item.bodyCaptureStatus === "bodyless";
-      evidence.referenced ||= item.status === "referenced" || item.bodyCaptureStatus === "referenced";
-      evidence.delegated ||= item.status === "delegated" || item.bodyCaptureStatus === "delegated";
-      evidence.bodyReadFailed ||= item.status === "failed" || item.bodyCaptureStatus === "incomplete";
-      evidence.bodyPending ||= item.status === "pending";
-      evidence.captureSource = item.captureSource ?? evidence.captureSource;
-      if (item.body !== undefined) evidence.body = item.body;
-    } else if (item.kind === "http") {
-      evidence.responseSeen = true;
-      evidence.bodyCaptured ||= item.bodyCaptured === true ||
-        (item.bodyCaptureComplete === true && !["bodyless", "referenced", "delegated"].includes(item.bodyCaptureStatus));
-      evidence.bodyless ||= item.bodyCaptureStatus === "bodyless";
-      evidence.referenced ||= item.bodyCaptureStatus === "referenced" || item.body?.captureSource === "blob-source";
-      evidence.delegated ||= item.bodyCaptureStatus === "delegated";
-      evidence.bodyReadFailed ||= item.bodyCaptureStatus === "incomplete" || Boolean(item.body?.collection_error);
-      evidence.captureSource = item.captureSource ?? evidence.captureSource;
-      if (item.body !== undefined) evidence.body = item.body;
-    } else if (item.kind === "mock-response-delegated") {
-      evidence.delegated = true;
-      evidence.responseSeen = true;
-    }
-  }
-
-  for (const evidence of requests.values()) {
-    if (evidence.delegated) {
-      evidence.status = "delegated";
-    } else if (evidence.referenced) {
-      evidence.status = "referenced";
-    } else if (evidence.bodyless) {
-      evidence.status = "bodyless";
-    } else if (evidence.captureSource === "playwright-route-fetch") {
-      evidence.status = evidence.bodyCaptured ? "complete" : evidence.bodyPending ? "pending" : "incomplete";
-      if (!evidence.bodyCaptured && !evidence.bodyPending) evidence.reason = "body-read-failed";
-    } else if (evidence.bodyCaptured) {
-      evidence.status = evidence.requestFinished && !evidence.requestFailed ? "complete" : "unknown";
-      if (evidence.status === "unknown") {
-        evidence.reason = evidence.requestFailed ? "request-failed" : "request-not-finished";
-      }
-    } else if (evidence.bodyReadFailed) {
-      evidence.status = "incomplete";
-      evidence.reason = "body-read-failed";
-    } else if (evidence.bodyPending) {
-      evidence.status = "pending";
-      evidence.reason = "body-capture-pending";
-    } else if (evidence.requestFailed) {
-      evidence.status = "incomplete";
-      evidence.reason = "request-failed";
-    } else if (evidence.responseSeen) {
-      evidence.status = "not-recorded";
-      evidence.reason = "body-capture-not-recorded";
-    } else {
-      evidence.status = "not-applicable";
-    }
-  }
-  return requests;
-}
-
 export function missingResponseBodies(observations) {
-  const bodyEvidence = reconcilePlaywrightResponseBodies(observations);
-  const blobIds = new Set(observations.filter(item => item.kind === "blob-source").map(item => item.blobId));
+  const blobIds = new Set(observations
+    .filter(item => item?.kind === "blob-source")
+    .map(item => item.blobId));
   const missingBlobs = [];
   const seenBlobResponses = new Set();
   for (const item of observations.filter(item =>
-    (item.kind === "http" || item.kind === "capture-component" && item.component === "responseBody") &&
-    item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId))) {
+    item?.kind === "http" && item.body?.captureSource === "blob-source" && !blobIds.has(item.body.blobId))) {
     const key = item.responseId?.source === "playwright" && typeof item.responseId.requestId === "string"
       ? item.responseId.requestId
       : JSON.stringify([item.body.blobId, item.url]);
@@ -741,31 +655,34 @@ export function missingResponseBodies(observations) {
       captureSource: "blob-source",
     });
   }
+
   const incompleteResponses = [];
   const seenResponseIds = new Set();
-  for (const item of observations.filter(item => item.kind === "http" && item.responseId?.source === "playwright")) {
+  for (const item of observations.filter(item =>
+    item?.kind === "http" && item.responseId?.source === "playwright")) {
     const requestId = item.responseId.requestId;
     if (seenResponseIds.has(requestId)) continue;
     seenResponseIds.add(requestId);
-    const evidence = bodyEvidence.get(requestId);
-    if (["complete", "bodyless", "referenced", "delegated"].includes(evidence?.status)) continue;
+    const status = item.bodyCaptureStatus ?? "incomplete";
+    if (["complete", "bodyless", "referenced", "delegated"].includes(status)) continue;
     incompleteResponses.push({
       responseId: item.responseId,
       ...(item.frameId ? { frameId: item.frameId } : {}),
       method: item.method,
       url: item.url,
       status: item.status,
-      captureSource: item.captureSource ?? evidence?.captureSource ?? "playwright",
-      bodyCaptureStatus: evidence?.status ?? "not-recorded",
-      ...(evidence?.reason ? { bodyCompletenessReason: evidence.reason } : {}),
-      ...(evidence?.bodyCaptured ? { bodyCaptured: true } : {}),
+      captureSource: item.captureSource ?? "playwright",
+      bodyCaptureStatus: status,
+      ...(item.bodyCompletenessReason ? { bodyCompletenessReason: item.bodyCompletenessReason } : {}),
+      ...(item.bodyCaptured ? { bodyCaptured: true } : {}),
       ...(item.body !== undefined ? { body: item.body } : {}),
     });
   }
+
   const mockResponseKey = item => JSON.stringify([item.method, item.url, item.status]);
-  const delegatedMockResponses = observations.filter(item => item.kind === "mock-response-delegated");
+  const delegatedMockResponses = observations.filter(item => item?.kind === "mock-response-delegated");
   const capturedMockResponses = observations.filter(item =>
-    item.kind === "http" && item.captureSource === "msw-response:mocked" && item.bodyCaptureComplete === true);
+    item?.kind === "http" && item.captureSource === "msw-response:mocked" && item.bodyCaptureStatus === "complete");
   const delegatedByKey = new Map();
   const capturedCounts = new Map();
   for (const item of delegatedMockResponses) {
@@ -776,11 +693,11 @@ export function missingResponseBodies(observations) {
     const key = mockResponseKey(item);
     capturedCounts.set(key, (capturedCounts.get(key) ?? 0) + 1);
   }
-  const missingMockResponses = [];
+  const mockMismatches = [];
   for (const [key, delegated] of delegatedByKey) {
     const missingCount = delegated.length - (capturedCounts.get(key) ?? 0);
     for (const item of delegated.slice(0, Math.max(0, missingCount))) {
-      missingMockResponses.push({
+      mockMismatches.push({
         responseId: item.responseId,
         method: item.method,
         url: item.url,
@@ -790,13 +707,12 @@ export function missingResponseBodies(observations) {
     }
   }
   const delegatedCounts = new Map([...delegatedByKey].map(([key, items]) => [key, items.length]));
-  const extraMockResponses = [];
   for (const [key, capturedCount] of capturedCounts) {
     const extraCount = capturedCount - (delegatedCounts.get(key) ?? 0);
     if (extraCount <= 0) continue;
     const matching = capturedMockResponses.filter(item => mockResponseKey(item) === key);
     for (const item of matching.slice(-extraCount)) {
-      extraMockResponses.push({
+      mockMismatches.push({
         responseId: item.responseId,
         method: item.method,
         url: item.url,
@@ -806,12 +722,11 @@ export function missingResponseBodies(observations) {
     }
   }
   const seenMockRequestIds = new Set();
-  const duplicateMockResponses = [];
   for (const item of capturedMockResponses) {
     const requestId = item.responseId?.requestId;
     if (typeof requestId !== "string") continue;
     if (seenMockRequestIds.has(requestId)) {
-      duplicateMockResponses.push({
+      mockMismatches.push({
         responseId: item.responseId,
         method: item.method,
         url: item.url,
@@ -822,204 +737,7 @@ export function missingResponseBodies(observations) {
       seenMockRequestIds.add(requestId);
     }
   }
-  const httpRequestIds = new Set(observations
-    .filter(item => item.kind === "http" && item.responseId?.source === "playwright")
-    .map(item => item.responseId.requestId));
-  const unaggregatedResponses = [];
-  const seenUnaggregatedIds = new Set();
-  for (const item of observations.filter(record => record.kind === "response-received" &&
-    record.responseId?.source === "playwright")) {
-    const requestId = item.responseId.requestId;
-    if (httpRequestIds.has(requestId) || seenUnaggregatedIds.has(requestId)) continue;
-    seenUnaggregatedIds.add(requestId);
-    const evidence = bodyEvidence.get(requestId);
-    if (["complete", "bodyless", "referenced", "delegated"].includes(evidence?.status)) continue;
-    unaggregatedResponses.push({
-      responseId: item.responseId,
-      ...(item.frameId ? { frameId: item.frameId } : {}),
-      method: item.method,
-      url: item.url,
-      status: item.status,
-      captureSource: evidence?.captureSource ?? "playwright",
-      bodyCaptureStatus: evidence?.status ?? "not-recorded",
-      ...(evidence?.reason ? { bodyCompletenessReason: evidence.reason } : {}),
-      ...(evidence?.bodyCaptured ? { bodyCaptured: true } : {}),
-      ...(evidence?.body !== undefined ? { body: evidence.body } : {}),
-    });
-  }
-  return [...missingBlobs, ...incompleteResponses, ...unaggregatedResponses, ...missingMockResponses, ...extraMockResponses, ...duplicateMockResponses];
-}
-
-export function summarizeCaptureLifecycle(observations) {
-  const bodyEvidenceByRequest = reconcilePlaywrightResponseBodies(observations);
-  const requests = new Map();
-  const frameEvents = [];
-  const pageEvents = [];
-  const mswResponses = [];
-  let pendingAtClose = [];
-  const timelineKinds = new Set([
-    "request-started", "response-received", "request-finished", "request-failed",
-  ]);
-  const getRequest = item => {
-    const responseId = item.responseId;
-    if (responseId?.source !== "playwright" || typeof responseId.requestId !== "string") return undefined;
-    let entry = requests.get(responseId.requestId);
-    if (!entry) {
-      entry = {
-        requestId: responseId.requestId,
-        events: [],
-        components: {},
-        failures: [],
-      };
-      requests.set(responseId.requestId, entry);
-    }
-    if (typeof item.frameId === "string") entry.frameId ??= item.frameId;
-    if (typeof item.method === "string") entry.method ??= item.method;
-    if (typeof item.url === "string") entry.url ??= safeUrl(item.url);
-    if (typeof item.resourceType === "string") entry.resourceType ??= item.resourceType;
-    if (typeof item.fromServiceWorker === "boolean") entry.fromServiceWorker ??= item.fromServiceWorker;
-    return entry;
-  };
-
-  for (const item of observations) {
-    if (!item || typeof item !== "object") continue;
-    if (item.kind === "capture-shutdown" && item.phase === "page-close-requested") {
-      pendingAtClose = (item.pendingOperations ?? []).map(operation => ({
-        operation: safeText(operation.operation ?? "unknown"),
-        ...(operation.responseId?.source === "playwright" ? { requestId: operation.responseId.requestId } : {}),
-        ...(typeof operation.frameId === "string" ? { frameId: operation.frameId } : {}),
-        ...(typeof operation.method === "string" ? { method: operation.method } : {}),
-        ...(typeof operation.url === "string" ? { url: safeUrl(operation.url) } : {}),
-        ...(typeof operation.elapsedMs === "number" ? { elapsedMs: operation.elapsedMs } : {}),
-        ...(typeof operation.completedMonotonicMs === "number" ? { completedMonotonicMs: operation.completedMonotonicMs } : {}),
-        ...(operation.evidence ? { evidence: safeBody(operation.evidence) } : {}),
-      }));
-    }
-    if (typeof item.kind === "string" && item.kind.startsWith("frame-")) {
-      frameEvents.push({
-        kind: item.kind,
-        ...(typeof item.frameId === "string" ? { frameId: item.frameId } : {}),
-        ...(typeof item.url === "string" ? { url: safeUrl(item.url) } : {}),
-        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } : {}),
-        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
-        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
-      });
-    }
-    if (["page-close-event", "page-crash"].includes(item.kind) || item.kind === "capture-shutdown") {
-      pageEvents.push({
-        kind: item.kind,
-        ...(typeof item.phase === "string" ? { phase: item.phase } : {}),
-        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } :
-          typeof item.at === "string" ? { eventAt: item.at } : {}),
-        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
-        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
-      });
-    }
-
-    if (item.kind === "http" && item.responseId?.source === "msw") {
-      mswResponses.push({
-        requestId: item.responseId.requestId,
-        method: item.method,
-        ...(typeof item.url === "string" ? { url: safeUrl(item.url) } : {}),
-        status: item.status,
-        bodyCaptureComplete: item.bodyCaptureComplete === true,
-      });
-    }
-
-    const entry = getRequest(item);
-    if (!entry) continue;
-    if (timelineKinds.has(item.kind)) {
-      entry.events.push({
-        kind: item.kind,
-        ...(typeof item.eventAt === "string" ? { eventAt: item.eventAt } : {}),
-        ...(typeof item.eventMonotonicMs === "number" ? { eventMonotonicMs: item.eventMonotonicMs } : {}),
-        ...(Number.isInteger(item.timelineSequence) ? { timelineSequence: item.timelineSequence } : {}),
-        ...(Number.isInteger(item.status) ? { status: item.status } : {}),
-        ...(typeof item.error === "string" ? { error: safeText(item.error) } : {}),
-      });
-    }
-    if (item.kind === "capture-component-started") {
-      entry.components[item.component] = {
-        status: "pending",
-        ...(typeof item.startedAt === "string" ? { startedAt: item.startedAt } : {}),
-        ...(typeof item.startedMonotonicMs === "number" ? { startedMonotonicMs: item.startedMonotonicMs } : {}),
-      };
-    } else if (item.kind === "capture-component") {
-      if (typeof item.captureSource === "string") entry.captureSource ??= item.captureSource;
-      entry.components[item.component] = {
-        status: item.status,
-        ...(typeof item.bodyCaptured === "boolean" ? { bodyCaptured: item.bodyCaptured } : {}),
-        ...(typeof item.bodyCaptureComplete === "boolean" ? { bodyCaptureComplete: item.bodyCaptureComplete } : {}),
-        ...(typeof item.bodyCaptureStatus === "string" ? { bodyCaptureStatus: item.bodyCaptureStatus } : {}),
-        ...(typeof item.bodyCompletenessReason === "string" ? { bodyCompletenessReason: item.bodyCompletenessReason } : {}),
-        ...(typeof item.startedAt === "string" ? { startedAt: item.startedAt } : {}),
-        ...(typeof item.completedAt === "string" ? { completedAt: item.completedAt } : {}),
-        ...(typeof item.elapsedMs === "number" ? { elapsedMs: item.elapsedMs } : {}),
-        ...(typeof item.completedMonotonicMs === "number" ? { completedMonotonicMs: item.completedMonotonicMs } : {}),
-        ...(typeof item.captureSource === "string" ? { captureSource: item.captureSource } : {}),
-      };
-      if (item.component === "responseBody" && item.status === "failed" &&
-          !entry.failures.some(failure => failure.operation === "response body")) {
-        const captureError = item.body?.collection_error;
-        const details = Array.isArray(captureError) ? captureError[0] : captureError;
-        const message = typeof details?.message === "string" ? details.message :
-          typeof captureError === "string" ? captureError : undefined;
-        if (message) {
-          entry.failures.push({
-            kind: "diagnostic-collection",
-            operation: "response body",
-            message: safeText(message),
-          });
-        }
-      }
-    } else if (item.kind === "http") {
-      entry.responseStatus = item.status;
-      entry.responseBodyStatus = item.bodyCaptureStatus ?? (item.bodyCaptureComplete ? "complete" : "incomplete");
-      if (typeof item.captureSource === "string") entry.captureSource = item.captureSource;
-      if (typeof item.resourceType === "string") entry.resourceType ??= item.resourceType;
-      if (typeof item.fromServiceWorker === "boolean") entry.fromServiceWorker ??= item.fromServiceWorker;
-      entry.httpRecord = true;
-    } else if (item.kind === "mock-response-delegated") {
-      entry.responseStatus = item.status;
-      entry.responseBodyStatus = "delegated";
-      entry.captureSource = "msw-response:mocked";
-      entry.delegatedToMSW = true;
-    } else if (item.kind === "diagnostic-collection" || item.kind === "requestfailed" ||
-      (item.kind === "failure" && ["diagnostic-collection", "requestfailed"].includes(item.failureKind))) {
-      const failureKind = item.kind === "failure" ? item.failureKind : item.kind;
-      entry.failures.push({
-        kind: failureKind,
-        operation: safeText(item.operation ?? failureKind),
-        ...(typeof item.error?.message === "string" ? { message: safeText(item.error.message) } :
-          typeof item.error === "string" ? { message: safeText(item.error) } : {}),
-      });
-    }
-  }
-
-  const result = [...requests.values()].map(entry => {
-    entry.events.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
-    entry.responseStatus ??= entry.events.find(event => event.kind === "response-received")?.status;
-    const bodyEvidence = bodyEvidenceByRequest.get(entry.requestId);
-    if (bodyEvidence) {
-      entry.responseBodyStatus = bodyEvidence.status;
-      if (bodyEvidence.bodyCaptured) entry.responseBodyCaptured = true;
-      if (bodyEvidence.reason) entry.responseBodyCompletenessReason = bodyEvidence.reason;
-    } else {
-      entry.responseBodyStatus ??= Number.isInteger(entry.responseStatus) ? "not-recorded" : "not-applicable";
-    }
-    return entry;
-  }).sort((first, second) => (first.events[0]?.timelineSequence ?? 0) - (second.events[0]?.timelineSequence ?? 0));
-  frameEvents.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
-  pageEvents.sort((first, second) => (first.timelineSequence ?? 0) - (second.timelineSequence ?? 0));
-  return {
-    requestCount: result.length,
-    responseCount: result.filter(entry => Number.isInteger(entry.responseStatus)).length,
-    requests: result,
-    frameEvents,
-    pageEvents,
-    mswResponses,
-    pendingAtClose,
-  };
+  return [...missingBlobs, ...incompleteResponses, ...mockMismatches];
 }
 
 function samePlaywrightResponse(first, second) {
@@ -1247,10 +965,6 @@ async function serializeResponseBody(responseBody, responseHeaders, context, opt
   return { body: bodyCaptured ? body : responseBody, bodyCaptured, bytes };
 }
 
-function collectionStatus(value) {
-  return isObject(value) && Object.hasOwn(value, "collection_error") ? "failed" : "captured";
-}
-
 function responseHeaderHint(response) {
   try {
     return typeof response.headers === "function" ? response.headers() : {};
@@ -1260,40 +974,23 @@ function responseHeaderHint(response) {
 }
 
 function responseBodyCaptureEvidence({ isBlob, bodylessResponse, bodyCaptured, independentCapture, networkState }) {
-  if (isBlob) return { bodyCaptured: false, bodyCaptureComplete: true, bodyCaptureStatus: "referenced" };
-  if (bodylessResponse) return { bodyCaptured: false, bodyCaptureComplete: true, bodyCaptureStatus: "bodyless" };
+  if (isBlob) return { bodyCaptured: false, bodyCaptureStatus: "referenced" };
+  if (bodylessResponse) return { bodyCaptured: false, bodyCaptureStatus: "bodyless" };
   if (!bodyCaptured) {
     return {
       bodyCaptured: false,
-      bodyCaptureComplete: false,
       bodyCaptureStatus: "incomplete",
       bodyCompletenessReason: "body-read-failed",
     };
   }
   if (independentCapture || networkState === "finished") {
-    return { bodyCaptured: true, bodyCaptureComplete: true, bodyCaptureStatus: "complete" };
+    return { bodyCaptured: true, bodyCaptureStatus: "complete" };
   }
   return {
     bodyCaptured: true,
-    bodyCaptureComplete: false,
     bodyCaptureStatus: "unknown",
     bodyCompletenessReason: networkState === "failed" ? "request-failed" : "request-not-finished",
   };
-}
-
-function captureComponent(options, state, component, status, fields = {}) {
-  state.components[component] = status;
-  if (["captured", "bodyless", "referenced", "delegated"].includes(status) && !state.savedComponents.includes(component)) {
-    state.savedComponents.push(component);
-  }
-  options.record("capture-component", {
-    ...state.context,
-    component,
-    status,
-    completedAt: new Date().toISOString(),
-    completedMonotonicMs: monotonicNow(),
-    ...fields,
-  });
 }
 
 function captureResponse(response, options, state) {
@@ -1315,8 +1012,6 @@ function captureResponse(response, options, state) {
   state.responseStatus = response.status();
   state.fromServiceWorker = fromServiceWorker;
   if (isMockResponse) {
-    state.components.responseHeaders = "delegated";
-    state.components.responseBody = "delegated";
     options.record("mock-response-delegated", {
       ...context,
       responseId,
@@ -1335,92 +1030,15 @@ function captureResponse(response, options, state) {
     : "HTTP response has no body";
   let responseHeadersValue;
   let responseBodySerialized;
-  let headersSettled = false;
-  let bodySettled = false;
-  let aggregateStarted = false;
-  let aggregateTracked;
-  const writeAggregate = () => {
-    if (!headersSettled || !bodySettled || aggregateStarted) return;
-    aggregateStarted = true;
-    const aggregateTask = Promise.all([
-      state.requestHeadersTask,
-      state.requestBodyTask,
-    ]).then(() => {
-      const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
-      const bodyEvidence = responseBodyCaptureEvidence({
-        isBlob,
-        bodylessResponse,
-        bodyCaptured: Boolean(responseBodySerialized?.bodyCaptured),
-        independentCapture: captureSource === "playwright-route-fetch",
-        networkState: state.networkState,
-      });
-      options.record("http", {
-        responseId,
-        ...(state.frameId ? { frameId: state.frameId } : {}),
-        status: context.status,
-        method: request.method(),
-        resourceType,
-        url,
-        requestHeaders: safeHeaders(state.requestHeadersValue),
-        headers: safeHeaders(responseHeadersValue),
-        requestBody: state.requestBodyValue,
-        body: responseBodySerialized?.body,
-        ...bodyEvidence,
-        captureSource,
-        ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
-      });
-      if (context.status >= 400) {
-        options.addFailure({
-          kind: "http",
-          responseId,
-          url,
-          method: request.method(),
-          resourceType,
-          status: context.status,
-        });
-      }
-    });
-    aggregateTracked = trackPending(options.pending, "aggregate response record", aggregateTask, context, options.addFailure, {
-      evidenceSnapshot: state.snapshot,
-    });
-  };
 
-  state.components.responseHeaders = "pending";
-  const headerStartedAt = new Date().toISOString();
-  const headerStartedMonotonicMs = monotonicNow();
-  options.record("capture-component-started", {
-    ...context,
-    component: "responseHeaders",
-    startedAt: headerStartedAt,
-    startedMonotonicMs: headerStartedMonotonicMs,
-  });
   const responseHeadersTask = (routedBodyPromise
     ? routedBodyPromise.then(capture => capture.ok ? capture.headers : { collection_error: safeError(capture.error) })
     : collect("response headers", () => readHeaders(response), context, options.addFailure)
   ).then(headers => {
     responseHeadersValue = headers;
-    headersSettled = true;
-    captureComponent(options, state, "responseHeaders", collectionStatus(headers), {
-      value: safeHeaders(headers),
-      startedAt: headerStartedAt,
-      elapsedMs: Math.max(0, Math.round(monotonicNow() - headerStartedMonotonicMs)),
-    });
-    writeAggregate();
     return headers;
   });
-  const responseHeadersTracked = trackPending(options.pending, "response headers capture", responseHeadersTask, context, options.addFailure, {
-    evidenceSnapshot: state.snapshot,
-  });
 
-  const bodyStartedAt = new Date().toISOString();
-  const bodyStartedMonotonicMs = monotonicNow();
-  options.record("capture-component-started", {
-    ...context,
-    component: "responseBody",
-    startedAt: bodyStartedAt,
-    startedMonotonicMs: bodyStartedMonotonicMs,
-  });
-  state.components.responseBody = "pending";
   let responseBodyTask;
   if (isBlob) {
     responseBodyTask = Promise.resolve({
@@ -1466,39 +1084,50 @@ function captureResponse(response, options, state) {
       const headersForSerialization = bodyResult?.headers ?? headerHint;
       responseBodySerialized = await serializeResponseBody(bodyBytes, headersForSerialization, context, options);
     }
-    bodySettled = true;
-    const status = isBlob ? "referenced" : bodylessResponse ? "bodyless" :
-      responseBodySerialized.bodyCaptured ? "captured" : "failed";
-    const captureSource = bodyResult?.captureSource ?? (routedBodyPromise ? "playwright-route-fetch" : isBlob ? "blob-source" : "playwright");
+    return responseBodySerialized;
+  });
+  const captureTask = Promise.all([
+    responseHeadersTask,
+    responseBodyTask,
+    state.requestHeadersTask,
+    state.requestBodyTask,
+    state.requestStarted ? state.networkSettled : Promise.resolve(),
+  ]).then(() => {
+    const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
     const bodyEvidence = responseBodyCaptureEvidence({
       isBlob,
       bodylessResponse,
-      bodyCaptured: Boolean(responseBodySerialized.bodyCaptured),
+      bodyCaptured: Boolean(responseBodySerialized?.bodyCaptured),
       independentCapture: captureSource === "playwright-route-fetch",
       networkState: state.networkState,
     });
-    captureComponent(options, state, "responseBody", status, {
-      body: responseBodySerialized.body,
+    options.record("http", {
+      responseId,
+      ...(state.frameId ? { frameId: state.frameId } : {}),
+      status: context.status,
+      method: request.method(),
+      resourceType,
+      url,
+      requestHeaders: safeHeaders(state.requestHeadersValue),
+      headers: safeHeaders(responseHeadersValue),
+      requestBody: state.requestBodyValue,
+      body: responseBodySerialized?.body,
       ...bodyEvidence,
       captureSource,
-      startedAt: bodyStartedAt,
-      elapsedMs: Math.max(0, Math.round(monotonicNow() - bodyStartedMonotonicMs)),
+      ...(fromServiceWorker !== undefined ? { fromServiceWorker } : {}),
     });
-    writeAggregate();
-    return responseBodySerialized;
+    if (context.status >= 400) {
+      options.addFailure({
+        kind: "http",
+        responseId,
+        url,
+        method: request.method(),
+        resourceType,
+        status: context.status,
+      });
+    }
   });
-  const responseBodyTracked = trackPending(options.pending, "response body capture", responseBodyTask, context, options.addFailure, {
-    evidenceSnapshot: state.snapshot,
-  });
-  const captureTask = Promise.allSettled([
-    responseHeadersTracked,
-    responseBodyTracked,
-    state.requestHeadersTask,
-    state.requestBodyTask,
-  ]).then(() => aggregateTracked?.catch(() => {}));
-  trackPending(options.pending, "response capture", captureTask, context, options.addFailure, {
-    evidenceSnapshot: state.snapshot,
-  });
+  trackPending(options.pending, "response capture", captureTask, context, options.addFailure);
 }
 
 async function captureConsole(message, options) {
@@ -1591,10 +1220,10 @@ function captureRequestFailure(request, options, state) {
     ...state.context,
     requestHeaders: state.requestHeadersReady
       ? safeHeaders(state.requestHeadersValue)
-      : { captureStatus: state.components.requestHeaders },
+      : { captureStatus: "not-recorded" },
     requestBody: state.requestBodyReady
       ? state.requestBodyValue
-      : { captureStatus: state.components.requestBody },
+      : { captureStatus: "not-recorded" },
     error,
   };
   options.record("requestfailed", item);
@@ -1671,28 +1300,19 @@ export function installPageDiagnostics(
         method: request.method(),
         resourceType: request.resourceType(),
       };
+      let networkSettledResolve;
+      const networkSettled = new Promise(resolve => { networkSettledResolve = resolve; });
       state = {
         responseId,
         frameId,
         context,
-        components: {
-          requestHeaders: "not-started",
-          requestBody: "not-started",
-          responseHeaders: "not-observed",
-          responseBody: "not-observed",
-        },
-        savedComponents: [],
         networkState: "not-observed",
+        requestStarted: false,
         requestEvidenceStarted: false,
         requestHeadersReady: false,
         requestBodyReady: false,
-        snapshot: () => ({
-          responseId,
-          ...(frameId ? { frameId } : {}),
-          networkState: state.networkState,
-          components: { ...state.components },
-          savedComponents: [...state.savedComponents],
-        }),
+        networkSettled,
+        networkSettledResolve,
       };
       requestStates.set(request, state);
       return state;
@@ -1700,16 +1320,6 @@ export function installPageDiagnostics(
     ensureRequestEvidence(request, state = options.requestStateFor(request)) {
       if (state.requestEvidenceStarted) return state;
       state.requestEvidenceStarted = true;
-      const headersStartedAt = new Date().toISOString();
-      const headersStartedMonotonicMs = monotonicNow();
-      state.components.requestHeaders = "pending";
-      state.components.requestBody = "pending";
-      options.record("capture-component-started", {
-        ...state.context,
-        component: "requestHeaders",
-        startedAt: headersStartedAt,
-        startedMonotonicMs: headersStartedMonotonicMs,
-      });
       const headersTask = collect(
         "request headers",
         () => readHeaders(request),
@@ -1718,25 +1328,10 @@ export function installPageDiagnostics(
       ).then(headers => {
         state.requestHeadersValue = headers;
         state.requestHeadersReady = true;
-        captureComponent(options, state, "requestHeaders", collectionStatus(headers), {
-          value: safeHeaders(headers),
-          startedAt: headersStartedAt,
-          elapsedMs: Math.max(0, Math.round(monotonicNow() - headersStartedMonotonicMs)),
-        });
         return headers;
       });
-      state.requestHeadersTask = trackPending(pending, "request headers capture", headersTask, state.context, options.addFailure, {
-        evidenceSnapshot: state.snapshot,
-      });
+      state.requestHeadersTask = headersTask;
 
-      const bodyStartedAt = new Date().toISOString();
-      const bodyStartedMonotonicMs = monotonicNow();
-      options.record("capture-component-started", {
-        ...state.context,
-        component: "requestBody",
-        startedAt: bodyStartedAt,
-        startedMonotonicMs: bodyStartedMonotonicMs,
-      });
       const bodyTask = headersTask.then(headers => collect(
         "request body",
         () => requestBody(request, headers),
@@ -1745,16 +1340,9 @@ export function installPageDiagnostics(
       )).then(body => {
         state.requestBodyValue = body;
         state.requestBodyReady = true;
-        captureComponent(options, state, "requestBody", collectionStatus(body), {
-          value: safeBody(body),
-          startedAt: bodyStartedAt,
-          elapsedMs: Math.max(0, Math.round(monotonicNow() - bodyStartedMonotonicMs)),
-        });
         return body;
       });
-      state.requestBodyTask = trackPending(pending, "request body capture", bodyTask, state.context, options.addFailure, {
-        evidenceSnapshot: state.snapshot,
-      });
+      state.requestBodyTask = bodyTask;
       return state;
     },
   };
@@ -1805,6 +1393,7 @@ export function installPageDiagnostics(
   listen("request", (request) => {
     try {
       const state = options.requestStateFor(request);
+      state.requestStarted = true;
       const event = eventStamp();
       if (!["finished", "failed"].includes(state.networkState)) state.networkState = "in-progress";
       let redirectedFrom;
@@ -1830,6 +1419,7 @@ export function installPageDiagnostics(
     try {
       const state = options.requestStateFor(request);
       if (state.networkState !== "failed") state.networkState = "finished";
+      state.networkSettledResolve?.(state.networkState);
       options.recordObserved("request-finished", state.context);
     } catch (error) {
       options.addFailure({
@@ -1844,6 +1434,7 @@ export function installPageDiagnostics(
       const state = options.requestStateFor(request);
       options.ensureRequestEvidence(request, state);
       state.networkState = "failed";
+      state.networkSettledResolve?.("failed");
       options.recordObserved("request-failed", {
         ...state.context,
         error: safeText(request.failure()?.errorText ?? "unknown"),

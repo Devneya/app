@@ -7,7 +7,6 @@ import {
   isMockEmailConfirmed,
   MOCK_ACCESS_TOKEN,
   MOCK_CHECKOUT_URL,
-  MOCK_MODELS,
   MOCK_USER,
   MOCK_VIRTUAL_KEY,
   mockGoTrueAuthResponse,
@@ -147,27 +146,12 @@ const authHandlers = [
   http.post(`${authBase}/logout`, () => HttpResponse.json({}, { status: 200 })),
 ];
 
-const llmHandlers = [
-  http.get(`${apiBase}/llm/v1/models`, () => {
-    const now = Math.floor(Date.now() / 1000);
-    return HttpResponse.json({
-      object: "list",
-      data: MOCK_MODELS.map((id) => ({
-        id,
-        object: "model",
-        created: now,
-        owned_by: "devneya",
-      })),
-    });
-  }),
-];
-
 const accountHandlers = [
   http.get(`${apiBase}/account/key`, ({ request }) => {
     if (!requireAuth(request)) {
       return unauthorized();
     }
-    return HttpResponse.json({ key: MOCK_VIRTUAL_KEY });
+    return HttpResponse.json({ key: session.subscribed ? MOCK_VIRTUAL_KEY : null });
   }),
 
   http.get(`${apiBase}/account/usage`, ({ request }) => {
@@ -186,7 +170,6 @@ const accountHandlers = [
     return HttpResponse.json({
       limit: 10,
       used: session.subscribed ? 0.42 : 0,
-      subscription_status: status,
       entitlement_status: status,
       cancel_at_period_end: cancelAtPeriodEnd,
       required_billing_action: requiredBillingAction,
@@ -258,4 +241,4 @@ const accountHandlers = [
   }),
 ];
 
-export const handlers = [...authHandlers, ...accountHandlers, ...llmHandlers];
+export const handlers = [...authHandlers, ...accountHandlers];

@@ -3,7 +3,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { renderApp } from "@/test/render";
-import { MOCK_MODELS, MOCK_USER, MOCK_VIRTUAL_KEY } from "@/mocks/data";
+import { MOCK_USER, MOCK_VIRTUAL_KEY } from "@/mocks/data";
 import { setMockBillingState, setMockSubscribed } from "@/mocks/handlers";
 import { config } from "@/config";
 import { server } from "@/mocks/server";
@@ -30,29 +30,17 @@ describe("InferencePage", () => {
     setMockSubscribed(false);
   });
 
-  it("shows virtual key after sign-in", async () => {
+  it("explains that the virtual key follows verified payment", async () => {
     renderApp("/login");
     await signInViaUi();
 
     await waitFor(() => {
-      expect(screen.getByText(MOCK_VIRTUAL_KEY)).toBeInTheDocument();
+      expect(screen.getByText(/API key will appear after the first verified payment/i)).toBeInTheDocument();
+      expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: €0.00 / €10.00");
       expect(screen.getByRole("link", { name: "LLM inference" })).toBeInTheDocument();
       expect(screen.getByText("[Devneya]")).toBeInTheDocument();
       expect(screen.queryByText(/\/ llm inference/i)).not.toBeInTheDocument();
     });
-  });
-
-  it("lists available models", async () => {
-    renderApp("/login");
-    await signInViaUi();
-
-    await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "Available models" })).toBeInTheDocument();
-      expect(screen.getByRole("list", { name: "Available models" })).toBeInTheDocument();
-    });
-    for (const id of MOCK_MODELS) {
-      expect(screen.getByText(id)).toBeInTheDocument();
-    }
   });
 
   it("shows subscribe button when not subscribed", async () => {
@@ -71,6 +59,7 @@ describe("InferencePage", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/Status:/)).toHaveTextContent("active");
+      expect(screen.getByText(MOCK_VIRTUAL_KEY)).toBeInTheDocument();
       expect(screen.getByText(/Spent:/)).toHaveTextContent("Spent: €0.42 / €10.00");
       expect(screen.getByRole("progressbar", { name: "Usage progress" })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Cancel subscription" })).toBeInTheDocument();
@@ -86,7 +75,6 @@ describe("InferencePage", () => {
       http.get(`${config.apiBaseUrl}/account/usage`, () => HttpResponse.json({
         used,
         limit: 10,
-        subscription_status: "active",
         entitlement_status: "active",
         cancel_at_period_end: false,
         access_until: null,
@@ -121,7 +109,6 @@ describe("InferencePage", () => {
   it.each([
     ["past_due", "update_payment", "button", "Update payment method"],
     ["review_required", "contact_support", "alert", "Billing requires support review."],
-    ["pending", "none", "alert", "Payment confirmation is pending."],
     ["expired", "subscribe", "button", "Subscribe"],
   ] as const)("renders the %s billing state", async (status, action, role, label) => {
     setMockBillingState(status, action);

@@ -92,10 +92,10 @@ async function apiFetch(
 
 export function fetchVirtualKey(accessToken: string): Promise<KeyResponse> {
   return apiFetch("/account/key", accessToken).then((value) => {
-    if (!isRecord(value)) {
+    if (!isRecord(value) || !(value.key === null || typeof value.key === "string")) {
       throw invalidResponse("API key", value);
     }
-    return { ...value, key: requiredString(value.key, "API key", value) } as KeyResponse;
+    return { ...value, key: value.key === null ? null : requiredString(value.key, "API key", value) } as KeyResponse;
   });
 }
 
@@ -109,7 +109,6 @@ export async function fetchUsage(accessToken: string): Promise<UsageResponse> {
     !Number.isFinite(value.used) ||
     typeof value.limit !== "number" ||
     !Number.isFinite(value.limit) ||
-    !isSubscriptionStatus(value.subscription_status) ||
     !isSubscriptionStatus(value.entitlement_status) ||
     typeof value.cancel_at_period_end !== "boolean" ||
     !isBillingAction(value.required_billing_action) ||
