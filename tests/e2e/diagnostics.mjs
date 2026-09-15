@@ -668,6 +668,38 @@ export function isConsoleCopyOfExpectedHttpFailure(failure, failures = [], expec
     other?.kind === "http" && other.url === failure.location.url && expectedHttpFailure(other));
 }
 
+function diagnosticSourceOrigins(failure) {
+  const values = [];
+  const add = value => {
+    if (typeof value === "string" && value) values.push(value);
+  };
+  add(failure?.url);
+  add(failure?.context?.url);
+  add(failure?.response?.url);
+  add(failure?.location?.url);
+  add(failure?.consoleOrigin);
+  add(failure?.text);
+  const addError = error => {
+    if (!error || typeof error !== "object") return;
+    add(error.message);
+    add(error.stack);
+    for (const operation of error.pendingOperations ?? []) add(operation?.url);
+  };
+  addError(failure?.error);
+  for (const error of failure?.errors ?? []) addError(error);
+  const origins = new Set();
+  for (const value of values) {
+    for (const match of value.matchAll(/https?:\/\/[^\s"'<>`\\)\]}]+/gi)) {
+      try {
+        origins.add(new URL(match[0].replace(/[.,;:!?]+$/, "")).origin);
+      } catch {
+        // A malformed URL in a diagnostic is not source attribution.
+      }
+    }
+  }
+  return origins;
+}
+
 export function classifyLiveRun({
   requiredAssertions = [],
   assertions = [],
@@ -720,6 +752,7 @@ export function classifyLiveRun({
     }
     if (kind === "diagnostic-collection" || kind === "diagnostic-drain") captureIncomplete = true;
     let sourceOrigin;
+    const observedOrigins = diagnosticSourceOrigins(failure);
     if (kind?.startsWith("console:")) {
       if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url") {
         try {
@@ -744,7 +777,10 @@ export function classifyLiveRun({
         }
       }
     }
-    if (sourceOrigin && !origins.has(sourceOrigin)) {
+    const allObservedOriginsAreThirdParty = observedOrigins.size > 0 &&
+      [...observedOrigins].every(origin => !origins.has(origin));
+    if ((sourceOrigin && !origins.has(sourceOrigin)) ||
+        (!sourceOrigin && allObservedOriginsAreThirdParty)) {
       thirdPartyDiagnostics.push(failure);
     } else {
       blockingFailures.push(failure);

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   captureMockResponse,
+  classifyLiveRun,
   drainBeforeClose,
   isAcceptedCaptureFailure,
   missingResponseBodies,
@@ -140,6 +141,64 @@ describe("browser diagnostics", () => {
     expect(isAcceptedCaptureFailure(readFailure, [readFailure, requestFailure], [
       { kind: "frame-detached", frameId, diagnosticOrder: 4 },
     ])).toBe(false);
+  });
+
+  it("attributes a detached third-party console error from its retained URL", () => {
+    const result = classifyLiveRun({
+      failures: [{
+        kind: "diagnostic-collection",
+        operation: "console document origin",
+        text: "Error loading iframe from https://static.sandbox.airwallex.com/frame.js",
+        consoleOriginSource: "unknown",
+        error: { message: "Frame was detached" },
+      }, {
+        kind: "console:error",
+        text: "Error loading iframe from https://static.sandbox.airwallex.com/frame.js",
+        consoleOriginSource: "unknown",
+      }],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toEqual([]);
+    expect(result.thirdPartyDiagnostics).toHaveLength(2);
+  });
+
+  it("attributes a third-party teardown timeout only from its pending URL", () => {
+    const failure = {
+      kind: "diagnostic-drain",
+      errors: [{
+        message: "capture timeout",
+        pendingOperations: [{ url: "https://captcha.example.test/logo.png" }],
+      }],
+    };
+    const result = classifyLiveRun({
+      failures: [failure],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toEqual([]);
+    expect(result.thirdPartyDiagnostics).toEqual([failure]);
+  });
+
+  it("keeps first-party and source-less diagnostic failures blocking", () => {
+    const firstParty = {
+      kind: "diagnostic-drain",
+      errors: [{ pendingOperations: [{ url: "https://api.stage.devneya.com/account" }] }],
+    };
+    const sourceLess = { kind: "diagnostic-drain", errors: [{ message: "capture timeout" }] };
+    const result = classifyLiveRun({
+      failures: [firstParty, sourceLess],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("failed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toEqual([firstParty, sourceLess]);
+    expect(result.thirdPartyDiagnostics).toEqual([]);
   });
 
   it("names unfinished reads during teardown and preserves their late errors", async () => {
