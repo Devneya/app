@@ -5,6 +5,7 @@ import { Alert, Box, Button, Container, Stack, TextField, Typography } from "@mu
 import { useAuth } from "@/auth/useAuth";
 import { deleteAccount, logout } from "@/api/account";
 import { describeError } from "@/api/errors";
+import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
@@ -87,8 +88,7 @@ export function AccountPage() {
         await deleteAccount(token);
         setDeletionCompleted(true);
       }
-      await signOut();
-      queryClient.clear();
+      await completeLocalSignOut(signOut, () => queryClient.clear());
     },
     onSuccess: () => navigate("/login"),
   });
@@ -117,8 +117,7 @@ export function AccountPage() {
         setPasswordStage(stage);
       }
       if (stage === "backend_logged_out") {
-        await signOut();
-        queryClient.clear();
+        await completeLocalSignOut(signOut, () => queryClient.clear());
         sessionStorage.setItem("devneya.passwordChanged", "1");
       }
     },

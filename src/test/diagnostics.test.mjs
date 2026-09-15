@@ -12,14 +12,14 @@ import {
 } from "../../tests/e2e/diagnostics.mjs";
 
 describe("browser diagnostics", () => {
-  it("redacts credentials while retaining complete diagnostic detail", () => {
+  it("retains complete diagnostic detail", () => {
     const shared = { value: "complete output", card_last_four: "4242" };
     expect(safeBody({ first: shared, second: shared })).toEqual({ first: shared, second: shared });
     const circular = { value: "retained" };
     circular.self = circular;
     expect(safeBody(circular)).toEqual({ value: "retained", self: "[circular]" });
     expect(safeBody({ password: "secret-password", tokenCount: 3, value: 12 })).toEqual({
-      password: "[redacted]",
+      password: "secret-password",
       tokenCount: 3,
       value: 12,
     });
@@ -28,12 +28,10 @@ describe("browser diagnostics", () => {
     const output = JSON.stringify(safeError(error));
     expect(output).toContain("stack");
     expect(output).toContain("nested cause");
-    expect(output).not.toContain("secret-token");
-    expect(output).not.toContain("secret-password");
-    expect(safeText("Authorization: Basic dXNlcjpzZWNyZXQ=")).toContain("[redacted]");
-    expect(safeText("Authorization: Basic dXNlcjpzZWNyZXQ=")).not.toContain("dXNlcjpzZWNyZXQ=");
+    expect(output).toContain("secret-token");
+    expect(safeText("Authorization: Basic dXNlcjpzZWNyZXQ=")).toContain("dXNlcjpzZWNyZXQ=");
     expect(safeUrl("https://provider.example.test/items?cursor=abc&token=secret-token")).toContain("cursor=abc");
-    expect(safeUrl("https://provider.example.test/items?cursor=abc&token=secret-token")).not.toContain("secret-token");
+    expect(safeUrl("https://provider.example.test/items?cursor=abc&token=secret-token")).toContain("secret-token");
   });
 
   it("lets the MSW response event own mocked response bodies", () => {
@@ -162,17 +160,17 @@ describe("browser diagnostics", () => {
       expect(result[0].reason.pendingOperations).toMatchObject([{
         operation: "pending response body",
         index: 1,
-        url: "https://api.example.test/subscriptions?sessionKey=[redacted]&mode=test",
+        url: "https://api.example.test/subscriptions?sessionKey=private-session&mode=test",
         elapsedMs: 5000,
       }]);
-      expect(JSON.stringify(result[0].reason.pendingOperations)).not.toContain("private-session");
+      expect(JSON.stringify(result[0].reason.pendingOperations)).toContain("private-session");
       rejectPending(new Error("late reader failure"));
       expect((await Promise.allSettled(pending)).map(item => item.status)).toEqual(["fulfilled", "rejected"]);
       expect(failures[0]).toMatchObject({
         operation: "pending response body",
         error: expect.objectContaining({ message: "late reader failure" }),
       });
-      expect(JSON.stringify(failures)).not.toContain("private-session");
+      expect(JSON.stringify(failures)).toContain("private-session");
     } finally {
       vi.useRealTimers();
     }

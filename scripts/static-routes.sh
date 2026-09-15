@@ -6,3 +6,7 @@ for route in login forgot-password reset-password auth/confirm account; do
   mkdir -p "dist/${route}"
   cp dist/index.html "dist/${route}/index.html"
 done
+
+if [[ "${VITE_USE_MOCKS:-false}" != "true" ]]; then
+  rm -f dist/mockServiceWorker.js
+fi

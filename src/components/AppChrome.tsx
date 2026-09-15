@@ -3,6 +3,7 @@ import { Link as RouterLink, useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Alert, AppBar, Box, Button, Menu, MenuItem, Toolbar, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
+import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { logout } from "@/api/account";
 import { describeError } from "@/api/errors";
 import { brand } from "@/theme";
@@ -45,8 +46,7 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         await logout(token);
         setLogoutCompleted(true);
       }
-      await signOut();
-      queryClient.clear();
+      await completeLocalSignOut(signOut, () => queryClient.clear());
     },
     onSuccess: () => navigate("/login"),
   });

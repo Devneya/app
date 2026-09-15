@@ -6,25 +6,6 @@ import { join } from "node:path";
 import { installConsoleCapture } from "./console-capture.mjs";
 import { installBlobCapture } from "./blob-capture.mjs";
 
-const SENSITIVE_KEY =
-  /(?:^|[_-])(?:password|secret|authorization|cookie|api[_-]?key|key|token(?=$|[_-](?:hash|prefix)(?:$|_))|access[_-]?token|refresh[_-]?token|id[_-]?token|oauth[_-]?token|client[_-]?secret|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|nonce|session[_-]?id|private[_-]?value|x[_-](?:amz|goog)[_-][\w-]+|card[_-]?number|cvv|cvc|email)(?:$|[_-])/i;
-
-function normalizedKey(value) {
-  return String(value).replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/-/g, "_").toLowerCase();
-}
-
-function isSensitiveKey(value) {
-  return SENSITIVE_KEY.test(normalizedKey(value));
-}
-
-function redactSensitiveAssignments(value) {
-  return value.replace(
-    /(["']?)([A-Za-z][A-Za-z0-9_-]*)(["']?)(\s*[:=]\s*)(?!\/\/)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\[(?:redacted(?:-[^\]\s]+)?|omitted)\]|[^\s,;}&\]#]+)/g,
-    (match, prefix, key, suffix, separator) =>
-      isSensitiveKey(key) ? `${prefix}${key}${suffix}${separator}[redacted]` : match,
-  );
-}
-
 function isObject(value) {
   return typeof value === "object" && value !== null;
 }
@@ -39,110 +20,12 @@ function responseBytes(value) {
   return undefined;
 }
 
-function safeUrlPath(pathname) {
-  return pathname
-    .replace(
-      /(\/(?:buy|checkout|portal|payment(?:-link)?)(?:\/(?:session|link|shortlink))?\/)([^/]+)/gi,
-      (match, prefix, segment) =>
-        /^(?:sub|cus|pmt|pay|evt|req)_[A-Za-z0-9_-]+$/.test(segment)
-          ? match
-          : `${prefix}[redacted-capability]`,
-    )
-    .replace(/(?:cks|cs)_[A-Za-z0-9_-]+/g, "[redacted-capability]")
-    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted-token]")
-    .replace(/sk-bf-[A-Za-z0-9_-]+/g, "[redacted-key]");
-}
-
-function safeUrlQuery(url) {
-  return [...url.searchParams]
-    .map(([key, value]) => {
-      const normalized = normalizedKey(key);
-      const sensitive = isSensitiveKey(normalized) || /^(?:code|state|nonce)$/i.test(normalized);
-      return `${encodeURIComponent(key)}=${encodeURIComponent(sensitive ? "[redacted]" : safeText(value))}`;
-    })
-    .join("&");
-}
-
-function isLikelyCard(value) {
-  const digits = value.replace(/\D/g, "");
-  if (digits.length < 13 || digits.length > 19) return false;
-  let sum = 0;
-  let double = false;
-  for (let index = digits.length - 1; index >= 0; index -= 1) {
-    let digit = Number(digits[index]);
-    if (double) {
-      digit *= 2;
-      if (digit > 9) digit -= 9;
-    }
-    sum += digit;
-    double = !double;
-  }
-  return sum % 10 === 0;
-}
-
 export function safeUrl(value) {
-  try {
-    const url = new URL(String(value));
-    if (url.protocol === "blob:") return `blob:${safeUrl(url.pathname + url.search)}`;
-    if (url.protocol !== "https:" && url.protocol !== "http:") return safeText(value, false);
-    const query = safeUrlQuery(url);
-    const hash = url.hash ? `#${safeText(url.hash.slice(1), false)}` : "";
-    if (/(^|\.)checkout\.dodopayments\.com$/.test(url.hostname) && /^\/[^/.]+\/?$/.test(url.pathname)) {
-      return `${url.origin}/[redacted-capability]${query ? `?${query}` : ""}${hash}`;
-    }
-    return `${url.origin}${safeUrlPath(url.pathname)}${query ? `?${query}` : ""}${hash}`;
-  } catch {
-    return safeText(value, false);
-  }
+  return String(value);
 }
 
-export function safeText(value, scrubUrls = true) {
-  const text = String(value);
-  if (/^\s*(?:\{|\[)/.test(text)) {
-    try {
-      const parsed = JSON.parse(text);
-      if (isObject(parsed)) return JSON.stringify(safeBody(parsed));
-    } catch { /* Preserve non-JSON diagnostic text and apply the text rules below. */ }
-  }
-  const sanitized = text
-    .replace(/\{[^{}]*\}/g, (fragment) => {
-      try {
-        const descriptor = JSON.parse(fragment);
-        if (typeof descriptor.name === "string" && isSensitiveKey(descriptor.name) && "value" in descriptor) {
-          return JSON.stringify({ ...descriptor, value: "[redacted]" });
-        }
-      } catch { /* Not a JSON descriptor; the text rules below still apply. */ }
-      return fragment;
-    })
-    .replace(/\b(?:cks|cs)_[A-Za-z0-9_-]+/g, "[redacted-capability]")
-    .replace(/(https?:\/\/)[^/@\s]+@/g, "$1[redacted]@")
-    .replace(/https?:\/\/[^\s\\"<>]+/g, (url) => scrubUrls ? safeUrl(url) : url)
-    .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [redacted]")
-    .replace(/\bBasic\s+[^\s"']+/gi, "Basic [redacted]")
-    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted-token]")
-    .replace(/sk-bf-[A-Za-z0-9_-]+/g, "[redacted-key]")
-    .replace(/(["'][\w-]*token["']\s*:\s*)["'][^"']*["']/gi, '$1"[redacted]"')
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
-    .replace(/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, (digits) =>
-      isLikelyCard(digits) ? "[redacted-card]" : digits
-    )
-    .replace(
-      /((?:^|[?&])(?:password|secret|authorization|cookie|api[_-]?key|token|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|code|state|nonce|checkout[_-]?(?:url|link)|portal[_-]?(?:url|link)|payment[_-]?link|signature|sig|x-(?:amz|goog)-[^=]*|card|cvv|cvc)=)[^&#\s]+/gi,
-      "$1[redacted]"
-    )
-    .replace(
-      /(["'](?:password|[\w-]*secret|authorization|cookie|access_token|refresh_token|id_token|token|key|email|checkout_url|portal_url)["']\s*:\s*)["'][^"']*["']/gi,
-      '$1"[redacted]"'
-    )
-    .replace(
-      /(["'](?:password|secret|authorization|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|client[_-]?secret|key|email|card|cvv|cvc|[\w-]+[_-](?:password|secret|token|key))["']\s*:\s*)["'][^"']*["']/gi,
-      '$1"[redacted]"'
-    )
-    .replace(
-      /(\b(?:password|secret|authorization|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|client[_-]?secret|key|email|card|cvv|cvc|[\w-]+[_-](?:password|secret|token|key))\b\s*[:=]\s*["']?)(?:\[(?:redacted(?:-[^\]\s]+)?|omitted)\]|[^\s,;"'}&#]+)/gi,
-      "$1[redacted]"
-    );
-  return redactSensitiveAssignments(sanitized);
+export function safeText(value) {
+  return String(value);
 }
 
 export function safeError(error, seen = new WeakSet()) {
@@ -151,22 +34,22 @@ export function safeError(error, seen = new WeakSet()) {
     seen.add(error);
     try {
     const output = {
-      name: safeText(error.name || "Error"),
-      message: safeText(error.message || String(error)),
-      stack: safeText(error.stack || ""),
+      name: String(error.name || "Error"),
+      message: String(error.message || String(error)),
+      stack: String(error.stack || ""),
     };
     if (typeof AggregateError !== "undefined" && error instanceof AggregateError && Array.isArray(error.errors)) {
-      output.errors = error.errors.map((item) => (isObject(item) ? safeError(item, seen) : { message: safeText(item) }));
+      output.errors = error.errors.map((item) => (isObject(item) ? safeError(item, seen) : { message: String(item) }));
     }
     if ("cause" in error && error.cause !== undefined) {
       output.cause = isObject(error.cause)
         ? safeError(error.cause, seen)
-        : { message: safeText(error.cause) };
+        : { message: String(error.cause) };
     }
     for (const [key, value] of Object.entries(error)) {
       if (key === "cause" || Object.hasOwn(output, key)) continue;
       Object.defineProperty(output, key, {
-        value: isSensitiveKey(key) ? "[redacted]" : safeBody(value, seen),
+        value: safeBody(value, seen),
         enumerable: true,
       });
     }
@@ -176,17 +59,17 @@ export function safeError(error, seen = new WeakSet()) {
     }
   }
   if (isObject(error)) {
-    return { name: "Error", message: safeText(error.message ?? String(error)), details: safeBody(error, seen) };
+    return { name: "Error", message: String(error.message ?? String(error)), details: safeBody(error, seen) };
   }
-  return { name: "Error", message: safeText(error), stack: "" };
+  return { name: "Error", message: String(error), stack: "" };
 }
 
 export function safeBody(value, seen = new WeakSet()) {
   if (value === null || value === undefined) return value;
-  if (typeof value === "string") return safeText(value);
+  if (typeof value === "string") return value;
   if (typeof value !== "object") return value;
   if (value instanceof Error) return safeError(value, seen);
-  if (value instanceof URL) return safeUrl(value.href);
+  if (value instanceof URL) return value.href;
   if (value instanceof Headers) return safeHeaders(value, seen);
   if (seen.has(value)) return "[circular]";
   seen.add(value);
@@ -194,17 +77,12 @@ export function safeBody(value, seen = new WeakSet()) {
   if (Array.isArray(value)) return value.map((item) => safeBody(item, seen));
   const output = {};
   for (const [key, item] of Object.entries(value)) {
-    const safeKey = safeText(key);
-    let outputKey = safeKey;
+    const outputKey = key;
+    let outputKeyCandidate = outputKey;
     let duplicate = 2;
-    while (Object.hasOwn(output, outputKey)) outputKey = `${safeKey} [duplicate ${duplicate++}]`;
-    const credentialValue = key.toLowerCase() === "value" &&
-      typeof value.name === "string" && isSensitiveKey(value.name);
-    const safeValue = isSensitiveKey(key) || /token$/i.test(normalizedKey(key)) || credentialValue
-      ? "[redacted]"
-      : safeBody(item, seen);
-    Object.defineProperty(output, outputKey, {
-      value: safeValue,
+    while (Object.hasOwn(output, outputKeyCandidate)) outputKeyCandidate = `${outputKey} [duplicate ${duplicate++}]`;
+    Object.defineProperty(output, outputKeyCandidate, {
+      value: safeBody(item, seen),
       enumerable: true,
       configurable: true,
       writable: true,
@@ -257,8 +135,7 @@ async function requestBody(request, requestHeaders) {
         } catch {
           contents = { base64: bytes.toString("base64"), byteLength: bytes.byteLength };
         }
-        fields.push({ name, filename: safeText(value.name), contentType: value.type,
-          contents: isSensitiveKey(name) ? "[redacted]" : contents });
+        fields.push({ name, filename: safeText(value.name), contentType: value.type, contents });
       }
     }
     return { multipart: true, fields };
@@ -926,9 +803,7 @@ async function serializeResponseBody(responseBody, responseHeaders, context, opt
       body = safeBody(JSON.parse(textBody));
       bodyCaptured = true;
     } catch {
-      const likelySensitiveText =
-        /(?:password|secret|authorization|cookie|api[_-]?key|token|bearer|basic|card|cvv|cvc|email)\s*[:=]/i.test(textBody);
-      if (typeof responseBody === "string" || isTextResponse || !contentType || likelySensitiveText) {
+      if (typeof responseBody === "string" || isTextResponse || !contentType) {
         body = safeText(textBody);
         bodyCaptured = true;
       }

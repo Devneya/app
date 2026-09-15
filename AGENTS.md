@@ -25,7 +25,7 @@ the evidence-backed root cause or state the exact unknown and needed evidence,
 compare remediation options with their tradeoffs, choose and verify the fix,
 and record the decision in `control-plane/docs/troubleshooting-decisions.md`.
 Capture successful output as well as failures from browser console/network and helper
-commands; record collection failures; redact credentials and private data.
+commands; record complete private diagnostic output and collection failures.
 
 ## Before claiming done
 

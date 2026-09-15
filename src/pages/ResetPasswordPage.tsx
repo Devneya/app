@@ -3,6 +3,7 @@ import { Link as RouterLink, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
+import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { logout } from "@/api/account";
 import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
@@ -56,8 +57,7 @@ export function ResetPasswordPage() {
       }
 
       if (stage === "backend_logged_out") {
-        await signOut();
-        queryClient.clear();
+        await completeLocalSignOut(signOut, () => queryClient.clear());
         sessionStorage.setItem("devneya.passwordChanged", "1");
         setDone(true);
         navigate("/login", { replace: true });
