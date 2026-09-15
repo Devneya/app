@@ -165,6 +165,27 @@ describe("browser diagnostics", () => {
     expect(result.thirdPartyDiagnostics).toHaveLength(2);
   });
 
+  it("uses the owning page origin when a console frame has already detached", () => {
+    const result = classifyLiveRun({
+      failures: [{
+        kind: "diagnostic-collection",
+        operation: "console document origin",
+        text: "Failed to submit form: status 403",
+        consoleOrigin: "https://test.checkout.dodopayments.com",
+        consoleOriginSource: "page-context",
+        error: { message: "Execution context was destroyed" },
+      }],
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toEqual([]);
+    expect(result.thirdPartyDiagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ consoleOriginSource: "page-context" }),
+    ]));
+  });
+
   it("attributes a third-party teardown timeout only from its pending URL", () => {
     const failure = {
       kind: "diagnostic-drain",

@@ -754,7 +754,8 @@ export function classifyLiveRun({
     let sourceOrigin;
     const observedOrigins = diagnosticSourceOrigins(failure);
     if (kind?.startsWith("console:")) {
-      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url") {
+      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url" ||
+          failure.consoleOriginSource === "page-context") {
         try {
           sourceOrigin = new URL(failure.consoleOrigin).origin;
         } catch {
@@ -1043,6 +1044,14 @@ function captureResponse(response, options, state) {
 
 async function captureConsole(message, options) {
   const location = safeBody(message.location());
+  let pageContextOrigin;
+  try {
+    const ownerPage = typeof message.page === "function" ? message.page() : undefined;
+    const pageUrl = ownerPage && typeof ownerPage.url === "function" ? ownerPage.url() : "";
+    if (pageUrl) pageContextOrigin = new URL(pageUrl).origin;
+  } catch {
+    pageContextOrigin = undefined;
+  }
   const item = {
     type: message.type(),
     text: safeText(message.text()),
@@ -1104,6 +1113,10 @@ async function captureConsole(message, options) {
       } catch {
         item.consoleOriginSource = "unknown";
       }
+    }
+    if (item.consoleOriginSource === "unknown" && pageContextOrigin) {
+      item.consoleOrigin = pageContextOrigin;
+      item.consoleOriginSource = "page-context";
     }
   } else {
     item.consoleOriginSource = "not-required";
