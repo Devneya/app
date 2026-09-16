@@ -243,11 +243,17 @@ export async function configurePageCapture(
   page,
   { record, addFailure, pending = [], binaryArtifactDir, captureBlobs = false } = {},
 ) {
-  await installConsoleCapture(page, payload => {
+  const consoleCapture = await installConsoleCapture(page, payload => {
     const safe = safeBody(payload);
-    record("console-call", safe);
-    if (payload.kind !== "console-call") {
-      addFailure({ kind: "diagnostic-collection", operation: "console source snapshot", ...safe });
+    const { kind: payloadKind, ...details } = safe;
+    record(payloadKind === "console-source-register" ? "console-source-register" : "console-call", safe);
+    if (payloadKind !== "console-call" && payloadKind !== "console-source-register") {
+      addFailure({
+        kind: "diagnostic-collection",
+        operation: "console source snapshot",
+        sourceKind: payloadKind,
+        ...details,
+      });
     }
   });
   if (captureBlobs) {
@@ -266,6 +272,7 @@ export async function configurePageCapture(
     })(), { url: safeUrl(payload.url) }, addFailure));
   }
   return {
+    consoleSourceOrigins: consoleCapture.sourceOrigins,
     responseBodyCapture: captureBlobs
       ? "Playwright response bodies; MSW owns mocked bodies; blob bytes captured at creation"
       : "Playwright response bodies; MSW owns mocked bodies",
@@ -740,8 +747,8 @@ export function classifyLiveRun({
     }
     if (kind === "diagnostic-collection" || kind === "diagnostic-drain") captureIncomplete = true;
     let sourceOrigin;
-    if (kind?.startsWith("console:")) {
-      if (failure.consoleOriginSource === "document-context" || failure.consoleOriginSource === "resource-url") {
+    if (kind?.startsWith("console:") || failure.operation === "console document origin") {
+      if (["document-context", "resource-url", "registered-document"].includes(failure.consoleOriginSource)) {
         try {
           sourceOrigin = new URL(failure.consoleOrigin).origin;
         } catch {
@@ -1033,12 +1040,17 @@ async function captureConsole(message, options) {
     location,
     argumentSource: "console-call",
   };
+  const registeredOrigin = options.consoleSourceOrigins?.get(location?.url);
+  if (registeredOrigin) {
+    item.consoleOrigin = registeredOrigin;
+    item.consoleOriginSource = "registered-document";
+  }
   if (item.type === "error") {
     let args;
     try {
       args = message.args();
     } catch (error) {
-      item.consoleOriginSource = "unknown";
+      item.consoleOriginSource ??= "unknown";
       item.consoleAttributionError = safeError(error);
       options.addFailure({
         kind: "diagnostic-collection",
@@ -1047,7 +1059,7 @@ async function captureConsole(message, options) {
         error: safeError(error),
       });
     }
-    if (Array.isArray(args) && args.length > 0 && typeof args[0]?.evaluate === "function") {
+    if (!item.consoleOriginSource && Array.isArray(args) && args.length > 0 && typeof args[0]?.evaluate === "function") {
       try {
         const origin = await args[0].evaluate(() => {
           try {
@@ -1075,7 +1087,7 @@ async function captureConsole(message, options) {
       }
     } else if (args === undefined && item.consoleOriginSource === "unknown") {
       // Reading the arguments itself failed; a URL fallback would hide that loss of attribution.
-    } else {
+    } else if (!item.consoleOriginSource) {
       try {
         const resourceUrl = location?.url;
         const origin = typeof resourceUrl === "string" ? new URL(resourceUrl).origin : undefined;
@@ -1127,7 +1139,15 @@ function captureRequestFailure(request, options, state) {
 
 export function installPageDiagnostics(
   page,
-  { record, addFailure, pending = [], binaryArtifactDir, mockResponseBodiesOrigin, responseBodies } = {}
+  {
+    record,
+    addFailure,
+    pending = [],
+    binaryArtifactDir,
+    mockResponseBodiesOrigin,
+    responseBodies,
+    consoleSourceOrigins,
+  } = {}
 ) {
   let diagnosticOrder = 0;
   const recordEvent = (kind, item) => record(kind, { ...item, diagnosticOrder: ++diagnosticOrder });
@@ -1154,6 +1174,7 @@ export function installPageDiagnostics(
     binaryArtifactDir,
     mockResponseBodiesOrigin,
     responseBodies,
+    consoleSourceOrigins,
     nextBinaryArtifact: () => ++binarySequence,
     responseIdFor(request) {
       let requestId = requestIds.get(request);

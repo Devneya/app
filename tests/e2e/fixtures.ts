@@ -39,8 +39,9 @@ export const test = base.extend<DiagnosticFixtures>({
       };
       const recordMockedResponse = (payload: unknown) => captureMockResponse(payload, { record, addFailure });
       let testFailure: unknown;
+      let configuration: Awaited<ReturnType<typeof configurePageCapture>> | undefined;
       try {
-        const configuration = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir, captureBlobs: false });
+        configuration = await configurePageCapture(page, { record, addFailure, pending, binaryArtifactDir, captureBlobs: false });
         record("diagnostic-config", configuration);
       } catch (error) {
         const failure = {
@@ -72,6 +73,7 @@ export const test = base.extend<DiagnosticFixtures>({
         pending,
         binaryArtifactDir,
         mockResponseBodiesOrigin: new URL(testInfo.project.metadata.mockApiBaseUrl).origin,
+        consoleSourceOrigins: configuration?.consoleSourceOrigins,
       });
       if (!testFailure) {
         try {

@@ -161,6 +161,20 @@ describe("browser diagnostics", () => {
     expect(result.thirdPartyDiagnostics).toEqual([]);
   });
 
+  it("does not accept unknown attribution after an unrelated frame disappears", () => {
+    const failure = {
+      kind: "diagnostic-collection",
+      operation: "console document origin",
+      consoleOriginSource: "unknown",
+      error: { message: "Frame was detached" },
+    };
+    expect(isAcceptedCaptureFailure(failure, [failure, {
+      kind: "console:error",
+      consoleOriginSource: "unknown",
+      consoleAttributionError: { message: "Frame was detached" },
+    }], [{ kind: "frame-detached", frameId: "unrelated", diagnosticOrder: 1 }])).toBe(false);
+  });
+
   it("keeps console context-read failures unknown instead of using the enclosing page", async () => {
     const listeners = new Map();
     const observations = [];
@@ -199,6 +213,54 @@ describe("browser diagnostics", () => {
         consoleOriginSource: "unknown",
       }),
     ]));
+  });
+
+  it("retains a registered external console source after its frame disappears", async () => {
+    const listeners = new Map();
+    const observations = [];
+    const failures = [];
+    const pending = [];
+    const page = {
+      on(event, listener) { listeners.set(event, listener); },
+      off() {},
+    };
+    installPageDiagnostics(page, {
+      record: (kind, item) => observations.push({ kind, ...item }),
+      addFailure: item => failures.push(item),
+      pending,
+      consoleSourceOrigins: new Map([
+        ["devneya-console-source-detached.js", "https://checkout.example.test"],
+      ]),
+    });
+    const message = {
+      type: () => "error",
+      text: () => "External checkout error",
+      location: () => ({ url: "devneya-console-source-detached.js" }),
+      args: () => { throw new Error("Execution context was destroyed"); },
+    };
+    listeners.get("console")(message);
+    await Promise.allSettled(pending);
+
+    const diagnosticFailure = failures.find(item => item.kind === "diagnostic-collection");
+    const consoleFailure = failures.find(item => item.kind === "console:error");
+    expect(diagnosticFailure).toMatchObject({
+      operation: "console document origin",
+      consoleOrigin: "https://checkout.example.test",
+      consoleOriginSource: "registered-document",
+    });
+    expect(consoleFailure).toMatchObject({
+      consoleOrigin: "https://checkout.example.test",
+      consoleOriginSource: "registered-document",
+    });
+    const result = classifyLiveRun({
+      failures,
+      firstPartyOrigins: ["https://api.stage.devneya.com"],
+      cleanupStatus: "verified",
+    });
+    expect(result.workflowStatus).toBe("passed");
+    expect(result.captureStatus).toBe("incomplete");
+    expect(result.blockingFailures).toEqual([]);
+    expect(result.thirdPartyDiagnostics).toEqual(expect.arrayContaining([diagnosticFailure, consoleFailure]));
   });
 
   it("keeps first-party console attribution blocking even when text names an external URL", () => {

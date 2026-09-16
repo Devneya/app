@@ -1,4 +1,4 @@
-/* global console */
+/* global console, URL */
 
 export const CONSOLE_CAPTURE_BINDING = "__devneyaCaptureConsoleCall";
 
@@ -186,6 +186,53 @@ function installInPage(bindingName, methods) {
     }
   };
 
+  let sourceId;
+  try {
+    sourceId = globalThis.crypto?.randomUUID?.();
+  } catch {
+    sourceId = undefined;
+  }
+  if (typeof sourceId !== "string" || !sourceId) {
+    sourceId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  const sourceURL = `devneya-console-source-${sourceId}.js`;
+  let documentOrigin;
+  try {
+    const url = new URL(globalThis.location.href);
+    if (["http:", "https:"].includes(url.protocol)) documentOrigin = url.origin;
+  } catch {
+    documentOrigin = undefined;
+  }
+  report({
+    kind: "console-source-register",
+    sourceId,
+    sourceURL,
+    documentOrigin,
+    at: new Date().toISOString(),
+  });
+
+  const createWrapper = (original, method) => {
+    const factorySource = `return function (...args) {
+      try {
+        return original.apply(this, args);
+      } finally {
+        capture(method, args);
+      }
+    };
+//# sourceURL=${sourceURL}`;
+    try {
+      return new Function("original", "capture", "method", factorySource)(original, capture, method);
+    } catch (error) {
+      report({
+        kind: "console-capture-install-error",
+        method,
+        error: formatFailure(error),
+        at: new Date().toISOString(),
+      });
+      return undefined;
+    }
+  };
+
   const capture = (method, args) => {
     try {
       const seen = captureState();
@@ -225,13 +272,7 @@ function installInPage(bindingName, methods) {
       Object.defineProperty(console, method, {
         configurable: true,
         writable: true,
-        value: function (...args) {
-          try {
-            return original.apply(this, args);
-          } finally {
-            capture(method, args);
-          }
-        },
+        value: createWrapper(original, method),
       });
     } catch (error) {
       report({
@@ -245,9 +286,20 @@ function installInPage(bindingName, methods) {
 }
 
 export async function installConsoleCapture(page, onCapture) {
+  const sourceOrigins = new Map();
   await page.exposeBinding(CONSOLE_CAPTURE_BINDING, (source, payload) => {
-    const frameUrl = source.frame.url();
-    const frameName = source.frame.name();
+    let frameUrl = "";
+    let frameName = "";
+    try {
+      frameUrl = source.frame.url();
+    } catch {
+      // The source frame may have disappeared before Playwright delivers the binding call.
+    }
+    try {
+      frameName = source.frame.name();
+    } catch {
+      // Keep the captured payload when the source frame is already detached.
+    }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       return onCapture({
         kind: "console-capture-error",
@@ -257,9 +309,20 @@ export async function installConsoleCapture(page, onCapture) {
         frameName,
       });
     }
+    if (payload.kind === "console-source-register" && typeof payload.sourceURL === "string") {
+      try {
+        const origin = new URL(payload.documentOrigin).origin;
+        if (["http:", "https:"].includes(new URL(payload.documentOrigin).protocol)) {
+          sourceOrigins.set(payload.sourceURL, origin);
+        }
+      } catch {
+        // An opaque document has no origin that can be trusted for classification.
+      }
+    }
     return onCapture({ ...payload, frameUrl, frameName });
   });
   await page.addInitScript({
     content: `(${installInPage.toString()})(${JSON.stringify(CONSOLE_CAPTURE_BINDING)}, ${JSON.stringify(CONSOLE_METHODS)})`,
   });
+  return { sourceOrigins };
 }
