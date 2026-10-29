@@ -200,7 +200,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setCleanupError({ action, cause: new Error("Browser session changed during cleanup; retry after the session update."), generation, session: origin });
       return false;
     }
-    queryClient.clear();
     setCleanupPending(true);
     const client = createSessionClient(origin);
     let failure: { cause: unknown } | null = null;
@@ -228,6 +227,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setCleanupError({ action, cause: failure.cause, generation, session: origin });
       return false;
     }
+    queryClient.clear();
     currentSession.current = null;
     setSession(null);
     setPasswordRecoveryPending(false);

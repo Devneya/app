@@ -9,6 +9,7 @@ import { server } from "@/mocks/server";
 import { supabase } from "@/supabase";
 import * as supabaseModule from "@/supabase";
 import { config } from "@/config";
+import { queryClient } from "@/App";
 
 async function authenticatedPage(route: string) {
   const session = mockGoTrueAuthResponse(MOCK_USER.email) as Session;
@@ -113,10 +114,12 @@ describe("Audit action completion belongs to its authenticated session", () => {
     await user.click(screen.getByRole("menuitem", { name: "Log out" }));
     await waitFor(() => expect(supabase.auth.signOut).toHaveBeenCalledOnce());
     act(() => { authEvent("SIGNED_IN", { ...session, refresh_token: "new-refresh" }); });
+    queryClient.setQueryData(["new-session"], "preserved");
     await act(async () => { finish({ error: null }); });
     await user.click(screen.getByRole("button", { name: `Account menu: ${MOCK_USER.email}` }));
     await waitFor(() => expect(screen.getByRole("menuitem", { name: "Log out" })).toBeEnabled());
     expect(screen.queryByRole("heading", { name: "Sign in" })).not.toBeInTheDocument();
+    expect(queryClient.getQueryData(["new-session"])).toBe("preserved");
   });
 
   it("does not clean up a new account when deletion finishes late", async () => {

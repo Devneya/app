@@ -1,6 +1,6 @@
 import * as supabaseModule from "@/supabase";
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { renderApp } from "@/test/render";
@@ -174,6 +174,7 @@ describe("InferencePage", () => {
 
     renderApp("/login");
     const user = await signInViaUi();
+    queryClient.setQueryData(["cleanup-retry"], "retained");
     await openAccountMenu(user);
     await user.click(screen.getByRole("menuitem", { name: "Log out" }));
 
@@ -184,12 +185,14 @@ describe("InferencePage", () => {
       expect(screen.getByRole("button", { name: "Retry browser cleanup" })).toBeInTheDocument();
     });
     expect(logoutRequests).toBe(1);
+    expect(queryClient.getQueryData(["cleanup-retry"])).toBe("retained");
 
     await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
     });
     expect(logoutRequests).toBe(1);
+    expect(queryClient.getQueryData(["cleanup-retry"])).toBeUndefined();
   });
   it("refreshes usage and key after delayed activation", async () => {
     renderApp("/login");
@@ -203,11 +206,41 @@ describe("InferencePage", () => {
     });
   });
 
-  it("clears cached data before SDK cleanup after verified logout", async () => {
-    const signOut = vi.spyOn(supabase.auth, "signOut").mockImplementation(async () => {
-      expect(queryClient.getQueryData(["cleanup-order"])).toBeUndefined();
-      return { error: null };
-    });
+  it("does not refetch account data after backend logout while browser cleanup is pending", async () => {
+    vi.mocked(supabaseModule.createSessionClient).mockRestore();
+    let revoked = false;
+    const afterLogout: string[] = [];
+    let finish!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    server.use(
+      http.post(`${config.apiBaseUrl}/account/logout`, () => { revoked = true; return HttpResponse.json({ status: "logged_out" }); }),
+      http.post(`${config.apiBaseUrl}/auth/logout`, async () => { entered(); await pending; return new HttpResponse(null, { status: 204 }); }),
+      http.get(`${config.apiBaseUrl}/account/key`, () => { if (revoked) { afterLogout.push("key"); return HttpResponse.json({}, { status: 401 }); } return HttpResponse.json({ key: null }); }),
+      http.get(`${config.apiBaseUrl}/account/usage`, () => { if (revoked) { afterLogout.push("usage"); return HttpResponse.json({}, { status: 401 }); } return HttpResponse.json({ limit: 10, used: 0, entitlement_status: "none", cancel_at_period_end: false, required_billing_action: "subscribe", access_until: null }); })
+    );
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Log out" }));
+    await started;
+    try {
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
+      expect(afterLogout).toEqual([]);
+      finish();
+      await screen.findByRole("heading", { name: "Sign in" });
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
+      expect(afterLogout).toEqual([]);
+    } finally {
+      finish();
+    }
+  });
+
+  it("clears cached data after verified browser cleanup", async () => {
+    let finish!: (value: { error: null }) => void;
+    const signOut = vi.spyOn(supabase.auth, "signOut").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     renderApp("/login");
     const user = await signInViaUi();
     await screen.findByRole("button", { name: "Subscribe" });
@@ -215,6 +248,9 @@ describe("InferencePage", () => {
     await openAccountMenu(user);
     await user.click(screen.getByRole("menuitem", { name: "Log out" }));
     await waitFor(() => expect(signOut).toHaveBeenCalledOnce());
+    expect(queryClient.getQueryData(["cleanup-order"])).toBe("retained");
+    await act(async () => { finish({ error: null }); });
+    await waitFor(() => expect(queryClient.getQueryData(["cleanup-order"])).toBeUndefined());
   });
 
   it("preserves cached data when backend logout fails", async () => {
