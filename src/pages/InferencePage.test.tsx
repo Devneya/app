@@ -326,7 +326,12 @@ describe("InferencePage", () => {
     await user.click(await screen.findByRole("button", { name: "Cancel subscription" }));
     expect(await screen.findByText(/Current cancellation failure/)).toBeInTheDocument();
     finishSubscribe();
-    await waitFor(() => expect(screen.getByText(/Current cancellation failure/)).toBeInTheDocument());
+    await waitFor(() => expect(queryClient.getMutationCache().getAll().some(mutation =>
+      mutation.state.status === "error" &&
+      mutation.state.error instanceof Error &&
+      mutation.state.error.message.includes("Older subscribe failure")
+    )).toBe(true));
+    expect(screen.getByText(/Current cancellation failure/)).toBeInTheDocument();
     expect(screen.queryByText(/Older subscribe failure/)).not.toBeInTheDocument();
   });
 
