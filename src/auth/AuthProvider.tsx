@@ -12,7 +12,7 @@ import type { Session, User } from "@supabase/supabase-js";
 import { Alert, Button } from "@mui/material";
 import { useQueryClient } from "@tanstack/react-query";
 import { describeError } from "@/api/errors";
-import { supabase } from "@/supabase";
+import { createPasswordClient, createRecoveryClient, createSessionClient, storedSession, supabase } from "@/supabase";
 
 export type SignUpResult = {
   needsEmailConfirmation: boolean;
@@ -26,10 +26,13 @@ type AuthContextValue = {
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<SignUpResult>;
   signInWithProvider: (provider: "google" | "github") => Promise<void>;
-  completeSession: (action: string) => Promise<boolean>;
+  sessionGeneration: number;
+  isSessionCurrent: (generation: number) => boolean;
+  isSessionUsable: (generation: number) => boolean;
+  completeSession: (action: string, generation?: number, retrySession?: Session) => Promise<boolean>;
   resetPasswordForEmail: (email: string) => Promise<void>;
-  updatePassword: (password: string) => Promise<void>;
-  changePassword: (currentPassword: string, nextPassword: string) => Promise<string>;
+  updatePassword: (password: string, origin: Session, generation: number) => Promise<boolean>;
+  changePassword: (currentPassword: string, nextPassword: string, originGeneration: number) => Promise<{ sessionToken: string; originGeneration: number } | null>;
   updateDisplayName: (name: string) => Promise<void>;
   updateEmail: (email: string) => Promise<void>;
 };
@@ -69,8 +72,10 @@ async function updateUserChecked(
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const sessionGeneration = useRef(0);
+  const [generation, setGeneration] = useState(0);
   const sessionIdentity = useRef<string | null>(null);
-  const [cleanupError, setCleanupError] = useState<{ action: string; cause: unknown } | null>(null);
+  const currentSession = useRef<Session | null>(null);
+  const [cleanupError, setCleanupError] = useState<{ action: string; cause: unknown; generation: number; session: Session } | null>(null);
   const [cleanupPending, setCleanupPending] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -83,20 +88,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((event, nextSession) => {
-      if (event !== "INITIAL_SESSION") {
-        authStateChangeReceived = true;
-      }
       if (!mounted) return;
-      if (nextSession && (event === "SIGNED_IN" || event === "PASSWORD_RECOVERY")) {
-        if (nextSession.refresh_token !== sessionIdentity.current) {
-          sessionGeneration.current += 1;
-          setCleanupError(null);
-        }
+      const persisted = storedSession();
+      if (event === "SIGNED_OUT" && persisted) return;
+      if (nextSession && (!persisted || nextSession.refresh_token !== persisted.refresh_token)) return;
+      if (event !== "INITIAL_SESSION") authStateChangeReceived = true;
+      const isNewSession = Boolean(
+        nextSession && (event === "SIGNED_IN" || event === "PASSWORD_RECOVERY") &&
+        nextSession.refresh_token !== sessionIdentity.current
+      );
+      if (isNewSession) {
+        sessionGeneration.current += 1;
+        setGeneration(sessionGeneration.current);
+        setCleanupError(null);
       }
       if (nextSession) sessionIdentity.current = nextSession.refresh_token;
+      currentSession.current = nextSession;
       if (event === "PASSWORD_RECOVERY" && nextSession) {
         setPasswordRecoveryPending(true);
-      } else if (event === "SIGNED_OUT") {
+      } else if (event === "SIGNED_OUT" || (event === "SIGNED_IN" && isNewSession)) {
         setPasswordRecoveryPending(false);
       }
       setSession(nextSession);
@@ -118,6 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setInitializationError(error);
         }
         sessionIdentity.current = data.session?.refresh_token ?? null;
+        currentSession.current = data.session;
         setSession(data.session);
         setLoading(false);
       } catch (error: unknown) {
@@ -172,22 +183,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const completeSession = useCallback(async (action: string) => {
-    const generation = sessionGeneration.current;
+  const isSessionCurrent = useCallback((owner: number) => owner === sessionGeneration.current, []);
+
+  const isSessionUsable = useCallback((owner: number) => {
+    if (!isSessionCurrent(owner)) return false;
+    const persisted = storedSession();
+    return !persisted || persisted.refresh_token === sessionIdentity.current;
+  }, [isSessionCurrent]);
+
+  const completeSession = useCallback(async (action: string, generation = sessionGeneration.current, retrySession?: Session) => {
+    if (!isSessionCurrent(generation)) return false;
+    const origin = currentSession.current ?? retrySession;
+    if (!origin) return false;
+    const persisted = storedSession();
+    if (persisted && persisted.refresh_token !== origin.refresh_token) {
+      setCleanupError({ action, cause: new Error("Browser session changed during cleanup; retry after the session update."), generation, session: origin });
+      return false;
+    }
     queryClient.clear();
     setCleanupPending(true);
+    const client = createSessionClient(origin);
+    let failure: { cause: unknown } | null = null;
     try {
-      const { error } = await supabase.auth.signOut({ scope: "local" });
+      const { error } = await client.auth.signOut({ scope: "local" });
       if (error) throw error;
-      if (generation === sessionGeneration.current) setCleanupError(null);
-      return true;
     } catch (cause) {
-      if (generation === sessionGeneration.current) setCleanupError({ action, cause });
-      return false;
+      failure = { cause };
+    }
+    try {
+      await client.auth.dispose();
+    } catch (cause) {
+      failure = { cause: failure ? new AggregateError([failure.cause, cause], "Browser cleanup and client disposal failed.", { cause }) : cause };
     } finally {
       setCleanupPending(false);
     }
-  }, [queryClient]);
+    const remaining = storedSession();
+    if (!isSessionCurrent(generation)) return false;
+    if (remaining && remaining.refresh_token !== origin.refresh_token) {
+      setCleanupError({ action, cause: failure?.cause ?? new Error("Browser session changed during cleanup; retry after the session update."), generation, session: origin });
+      return false;
+    }
+    if (!failure && remaining) failure = { cause: new Error("Browser session was not removed.") };
+    if (failure) {
+      setCleanupError({ action, cause: failure.cause, generation, session: origin });
+      return false;
+    }
+    currentSession.current = null;
+    setSession(null);
+    setPasswordRecoveryPending(false);
+    setCleanupError(null);
+    return true;
+  }, [queryClient, isSessionCurrent]);
 
   const resetPasswordForEmail = useCallback(async (email: string) => {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
@@ -198,30 +244,58 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const updatePassword = useCallback(async (password: string) => {
-    await updateUserChecked({ password }, undefined, "Password update");
-  }, []);
+  const updatePassword = useCallback(async (password: string, origin: Session, owner: number) => {
+    if (!isSessionUsable(owner)) return false;
+    const client = createRecoveryClient(origin);
+    let failure: { cause: unknown } | null = null;
+    try {
+      const { data, error } = await client.auth.updateUser({ password });
+      if (error) throw error;
+      if (!data.user) throw new Error("Password update did not return a user.", { cause: data });
+    } catch (cause) {
+      failure = { cause };
+    }
+    try {
+      await client.auth.dispose();
+    } catch (cause) {
+      if (failure) throw new AggregateError([failure.cause, cause], "Password update and client cleanup failed.", { cause });
+      throw cause;
+    }
+    if (failure) throw failure.cause;
+    return true;
+  }, [isSessionUsable]);
 
   const changePassword = useCallback(
-    async (currentPassword: string, nextPassword: string) => {
+    async (currentPassword: string, nextPassword: string, owner: number) => {
+      if (!isSessionUsable(owner)) return null;
       const email = session?.user?.email;
-      if (!email) {
-        throw new Error("Not signed in");
+      if (!email) throw new Error("Not signed in");
+      const client = createPasswordClient();
+      let failure: { cause: unknown } | null = null;
+      let outcome: { sessionToken: string; originGeneration: number } | null = null;
+      try {
+        const { data, error } = await client.auth.signInWithPassword({ email, password: currentPassword });
+        if (error) throw error;
+        if (!data.session) throw new Error("Reauthentication did not return a session", { cause: data });
+        if (isSessionUsable(owner)) {
+          const result = await client.auth.updateUser({ password: nextPassword });
+          if (result.error) throw result.error;
+          if (!result.data.user) throw new Error("Password update did not return a user.", { cause: result.data });
+          if (isSessionCurrent(owner)) outcome = { sessionToken: data.session.access_token, originGeneration: owner };
+        }
+      } catch (cause) {
+        failure = { cause };
       }
-      const { data, error: reauthError } = await supabase.auth.signInWithPassword({
-        email,
-        password: currentPassword,
-      });
-      if (reauthError) {
-        throw reauthError;
+      try {
+        await client.auth.dispose();
+      } catch (cause) {
+        if (failure) throw new AggregateError([failure.cause, cause], "Password change and client cleanup failed.", { cause });
+        throw cause;
       }
-      if (!data.session) {
-        throw new Error("Reauthentication did not return a session", { cause: data });
-      }
-      await updateUserChecked({ password: nextPassword }, undefined, "Password update");
-      return data.session.access_token;
+      if (failure) throw failure.cause;
+      return outcome;
     },
-    [session?.user?.email]
+    [session?.user?.email, isSessionCurrent, isSessionUsable]
   );
 
   const updateDisplayName = useCallback(async (name: string) => {
@@ -253,6 +327,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       signUp,
       signInWithProvider,
+      sessionGeneration: generation,
+      isSessionCurrent,
+      isSessionUsable,
       completeSession,
       resetPasswordForEmail,
       updatePassword,
@@ -268,6 +345,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       signUp,
       signInWithProvider,
+      generation,
+      isSessionCurrent,
+      isSessionUsable,
       completeSession,
       resetPasswordForEmail,
       updatePassword,
@@ -277,9 +357,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ]
   );
 
+  const persistedForNotice = cleanupError ? storedSession() : null;
+  const noticeOwned = cleanupError && cleanupError.generation === generation &&
+    (!persistedForNotice || persistedForNotice.refresh_token === (session?.refresh_token ?? cleanupError.session.refresh_token));
+
   return <AuthContext.Provider value={value}>
-    {cleanupError ? <Alert severity="error" onClose={() => setCleanupError(null)} action={<>
-      <Button color="inherit" disabled={cleanupPending} onClick={() => void completeSession(cleanupError.action)}>Retry browser cleanup</Button>
+    {noticeOwned && cleanupError ? <Alert severity="error" onClose={() => setCleanupError(null)} action={<>
+      <Button color="inherit" disabled={cleanupPending} onClick={() => void completeSession(cleanupError.action, cleanupError.generation, cleanupError.session)}>Retry browser cleanup</Button>
       <Button color="inherit" onClick={() => setCleanupError(null)}>Dismiss</Button>
     </>}>
       {cleanupError.action} completed, but browser cleanup failed: {describeError(cleanupError.cause)}

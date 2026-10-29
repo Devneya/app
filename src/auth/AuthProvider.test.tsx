@@ -1,9 +1,11 @@
+import * as supabaseModule from "@/supabase";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Session, User } from "@supabase/supabase-js";
 import { AuthProvider, useAuthContext } from "@/auth/AuthProvider";
 import { supabase } from "@/supabase";
+import { config } from "@/config";
 
 const testUser = {
   id: "user-id",
@@ -29,6 +31,10 @@ const testSession = {
   refresh_token: "refresh-token",
   user: testUser,
 } as unknown as Session;
+
+function persistTestSession(session: Session) {
+  localStorage.setItem(`sb-${new URL(config.apiBaseUrl).hostname.split(".")[0]}-auth-token`, JSON.stringify(session));
+}
 
 async function renderAuth(initialSession: Session | null = null) {
   const sessionResponse = initialSession
@@ -92,6 +98,7 @@ describe("AuthProvider response validation", () => {
     });
     vi.spyOn(supabase.auth, "initialize").mockImplementation(async () => {
       order.push("initialize");
+      persistTestSession(testSession);
       authStateCallback?.("PASSWORD_RECOVERY", testSession);
       return { error: null };
     });
@@ -129,7 +136,7 @@ describe("AuthProvider response validation", () => {
     });
     await waitFor(() => expect(supabase.auth.getSession).toHaveBeenCalledOnce());
 
-    act(() => authStateCallback?.("PASSWORD_RECOVERY", testSession));
+    act(() => { persistTestSession(testSession); authStateCallback?.("PASSWORD_RECOVERY", testSession); });
     await waitFor(() => expect(rendered.result.current.passwordRecoveryPending).toBe(true));
 
     await act(async () => {
@@ -224,13 +231,15 @@ describe("AuthProvider response validation", () => {
 
   it("preserves the update response when no user is returned", async () => {
     const data = { user: null, marker: "update-response" };
-    vi.spyOn(supabase.auth, "updateUser").mockResolvedValue({
+    const recoveryClient = { auth: { updateUser: vi.fn(), dispose: vi.fn().mockResolvedValue(undefined) } } as unknown as ReturnType<typeof supabaseModule.createRecoveryClient>;
+    vi.spyOn(supabaseModule, "createRecoveryClient").mockReturnValue(recoveryClient);
+    vi.spyOn(recoveryClient.auth, "updateUser").mockResolvedValue({
       data: data as never,
       error: null,
     });
     const { result } = await renderAuth();
 
-    await expect(result.current.updatePassword("next-password")).rejects.toMatchObject({
+    await expect(result.current.updatePassword("next-password", testSession, result.current.sessionGeneration)).rejects.toMatchObject({
       message: "Password update did not return a user.",
       cause: data,
     });
@@ -266,13 +275,15 @@ describe("AuthProvider response validation", () => {
 
   it("preserves the reauthentication response when no session is returned", async () => {
     const data = { user: testUser, session: null, marker: "reauth-response" };
-    vi.spyOn(supabase.auth, "signInWithPassword").mockResolvedValue({
+    const passwordClient = supabaseModule.createPasswordClient();
+    vi.spyOn(supabaseModule, "createPasswordClient").mockReturnValue(passwordClient);
+    vi.spyOn(passwordClient.auth, "signInWithPassword").mockResolvedValue({
       data: data as never,
       error: null,
     });
     const { result } = await renderAuth(testSession);
 
-    await expect(result.current.changePassword("current-password", "next-password")).rejects.toMatchObject({
+    await expect(result.current.changePassword("current-password", "next-password", result.current.sessionGeneration)).rejects.toMatchObject({
       message: "Reauthentication did not return a session",
       cause: data,
     });
@@ -307,9 +318,9 @@ describe("AuthProvider response validation", () => {
     await waitFor(() => expect(result.current.session).toBe(testSession));
     await act(async () => { await result.current.completeSession("Logout"); });
     expect(screen.getByText(/Logout completed, but browser cleanup failed/)).toBeInTheDocument();
-    act(() => { authEvent("SIGNED_IN", testSession); });
+    act(() => { persistTestSession(testSession); authEvent("SIGNED_IN", testSession); });
     expect(screen.getByText(/Logout completed, but browser cleanup failed/)).toBeInTheDocument();
-    act(() => { authEvent(event, { ...testSession, refresh_token: "new-refresh-token" }); });
+    act(() => { const next = { ...testSession, refresh_token: "new-refresh-token" }; persistTestSession(next); authEvent(event, next); });
     expect(screen.queryByText(/Logout completed, but browser cleanup failed/)).not.toBeInTheDocument();
   });
 

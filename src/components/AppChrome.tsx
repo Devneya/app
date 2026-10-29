@@ -30,21 +30,27 @@ const navLinkSx = (active: boolean) => ({
 });
 
 export function AppChrome({ section }: { section: "inference" | "account" }) {
-  const { session, completeSession } = useAuth();
+  const { session, sessionGeneration, isSessionCurrent, isSessionUsable, completeSession } = useAuth();
   const navigate = useNavigate();
   const label = accountLabel(session);
   const token = session?.access_token ?? "";
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
-  const [logoutCompleted, setLogoutCompleted] = useState(false);
+  const [logoutOwner, setLogoutOwner] = useState<number | null>(null);
+  const logoutCompleted = logoutOwner === sessionGeneration && isSessionUsable(sessionGeneration);
   const menuOpen = Boolean(menuAnchor);
+  const [logoutMutationOwner, setLogoutMutationOwner] = useState<number | null>(null);
 
   const logoutMutation = useMutation({
     mutationFn: async () => {
+      const owner = sessionGeneration;
+      setLogoutMutationOwner(owner);
       if (!logoutCompleted) {
+        if (!isSessionUsable(owner)) return false;
         await logout(token);
-        setLogoutCompleted(true);
+        if (!isSessionCurrent(owner)) return false;
+        setLogoutOwner(owner);
       }
-      return completeSession("Logout");
+      return completeSession("Logout", owner);
     },
     onSuccess: (completed) => { if (completed) navigate("/login"); },
   });
@@ -87,7 +93,7 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         >
           LLM inference
         </Typography>
-          {logoutMutation.error ? (
+          {logoutMutation.error && logoutMutationOwner === sessionGeneration && isSessionUsable(sessionGeneration) ? (
             <Button
               color="error"
               size="small"
@@ -168,7 +174,7 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         ) : null}
         </Toolbar>
       </AppBar>
-      {logoutMutation.error ? (
+      {logoutMutation.error && logoutMutationOwner === sessionGeneration && isSessionUsable(sessionGeneration) ? (
         <Alert severity="error" sx={{ borderRadius: 0 }}>
           {logoutCompleted
             ? `Backend logout completed, but local sign-out failed: ${describeError(logoutMutation.error)}`

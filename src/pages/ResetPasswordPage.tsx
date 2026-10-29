@@ -7,23 +7,27 @@ import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
 
 type PasswordStage = "none" | "password_changed" | "backend_logged_out";
-type ResetError = { cause: unknown; stage: PasswordStage };
+type ResetError = { cause: unknown; stage: PasswordStage; owner: number };
 
 export function ResetPasswordPage() {
-  const { session, passwordRecoveryPending, updatePassword, completeSession } = useAuth();
+  const { session, sessionGeneration, isSessionCurrent, isSessionUsable, passwordRecoveryPending, updatePassword, completeSession } = useAuth();
   const navigate = useNavigate();
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
+  const [passwordFields, setPasswordFields] = useState({ owner: sessionGeneration, password: "", confirm: "" });
+  const fields = passwordFields.owner === sessionGeneration && isSessionUsable(sessionGeneration) ? passwordFields : { owner: sessionGeneration, password: "", confirm: "" };
+  const { password, confirm } = fields;
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<ResetError | null>(null);
-  const [done, setDone] = useState(false);
-  const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
-  const passwordLogoutTokenRef = useRef<string | null>(null);
+  const [savedError, setError] = useState<ResetError | null>(null);
+  const error = savedError?.owner === sessionGeneration && isSessionUsable(sessionGeneration) ? savedError : null;
+  const [doneOwner, setDoneOwner] = useState<number | null>(null);
+  const [passwordProgress, setPasswordProgress] = useState<{ owner: number; stage: PasswordStage } | null>(null);
+  const passwordStage = passwordProgress?.owner === sessionGeneration && isSessionUsable(sessionGeneration) ? passwordProgress.stage : "none";
+  const passwordLogoutTokenRef = useRef<{ owner: number; token: string } | null>(null);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     setError(null);
     setSubmitting(true);
+    const owner = sessionGeneration;
     let stage = passwordStage;
     try {
       if (stage === "none") {
@@ -37,38 +41,43 @@ export function ResetPasswordPage() {
         if (!token) {
           throw new Error("Recovery session is missing.");
         }
-        await updatePassword(password);
-        passwordLogoutTokenRef.current = token;
+        if (!session) throw new Error("Recovery session is missing.");
+        if (!await updatePassword(password, session, owner)) return;
+        if (!isSessionCurrent(owner)) return;
+        passwordLogoutTokenRef.current = { owner, token };
         stage = "password_changed";
-        setPasswordStage(stage);
+        setPasswordProgress({ owner, stage });
       }
 
       if (stage === "password_changed") {
         const token = passwordLogoutTokenRef.current;
-        if (!token) {
+        if (!token || token.owner !== owner) {
           throw new Error("Password change recovery state is missing.");
         }
-        await logout(token);
+        if (!isSessionUsable(owner)) return;
+        await logout(token.token);
+        if (!isSessionCurrent(owner)) return;
         stage = "backend_logged_out";
-        setPasswordStage(stage);
+        setPasswordProgress({ owner, stage });
       }
 
       if (stage === "backend_logged_out") {
-        const completed = await completeSession("Password recovery");
+        const completed = await completeSession("Password recovery", owner);
+        if (!isSessionCurrent(owner)) return;
         sessionStorage.setItem("devneya.passwordChanged", "1");
         if (completed) {
-          setDone(true);
+          setDoneOwner(owner);
           navigate("/login", { replace: true });
         }
       }
     } catch (err) {
-      setError({ cause: err, stage });
+      if (isSessionCurrent(owner)) setError({ cause: err, stage, owner });
     } finally {
       setSubmitting(false);
     }
   }
 
-  if (done) {
+  if (doneOwner === sessionGeneration && isSessionUsable(sessionGeneration)) {
     return null;
   }
 
@@ -111,7 +120,7 @@ export function ResetPasswordPage() {
                   fullWidth
                   slotProps={{ htmlInput: { minLength: 6 } }}
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => setPasswordFields({ ...fields, password: e.target.value })}
                 />
                 <TextField
                   label="Confirm new password"
@@ -121,7 +130,7 @@ export function ResetPasswordPage() {
                   fullWidth
                   slotProps={{ htmlInput: { minLength: 6 } }}
                   value={confirm}
-                  onChange={(e) => setConfirm(e.target.value)}
+                  onChange={(e) => setPasswordFields({ ...fields, confirm: e.target.value })}
                 />
               </>
             ) : null}

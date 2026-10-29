@@ -1,3 +1,4 @@
+import * as supabaseModule from "@/supabase";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -265,7 +266,9 @@ describe("InferencePage", () => {
   it("reports password change cleanup failure without repeating the change or logout", async () => {
     let logouts = 0;
     server.use(http.post(`${config.apiBaseUrl}/account/logout`, () => { logouts++; return HttpResponse.json({ status: "logged_out" }); }));
-    const update = vi.spyOn(supabase.auth, "updateUser");
+    const passwordClient = supabaseModule.createPasswordClient();
+    vi.spyOn(supabaseModule, "createPasswordClient").mockReturnValue(passwordClient);
+    const update = vi.spyOn(passwordClient.auth, "updateUser");
     vi.spyOn(supabase.auth, "signOut").mockRejectedValueOnce(new Error("cleanup unavailable")).mockResolvedValue({ error: null });
     renderApp("/login");
     const user = await signInViaUi();

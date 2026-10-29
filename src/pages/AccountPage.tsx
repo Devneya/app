@@ -17,7 +17,7 @@ function readSavedName(session: ReturnType<typeof useAuth>["session"]): string {
 type PasswordStage = "none" | "password_changed" | "backend_logged_out";
 
 export function AccountPage() {
-  const { session, completeSession, changePassword, updateDisplayName, updateEmail } = useAuth();
+  const { session, sessionGeneration, isSessionCurrent, isSessionUsable, completeSession, changePassword, updateDisplayName, updateEmail } = useAuth();
   const navigate = useNavigate();
   const token = session?.access_token ?? "";
   const accountEmail = session?.user?.email ?? "";
@@ -30,16 +30,24 @@ export function AccountPage() {
     "success"
   );
   const [pendingEmail, setPendingEmail] = useState<string | null>(null);
-  const [currentPassword, setCurrentPassword] = useState("");
-  const [nextPassword, setNextPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordFields, setPasswordFields] = useState({ owner: sessionGeneration, current: "", next: "", confirm: "" });
+  const fields = passwordFields.owner === sessionGeneration && isSessionUsable(sessionGeneration) ? passwordFields : { owner: sessionGeneration, current: "", next: "", confirm: "" };
+  const { current: currentPassword, next: nextPassword, confirm: confirmPassword } = fields;
+  const setCurrentPassword = (value: string) => setPasswordFields({ ...fields, current: value });
+  const setNextPassword = (value: string) => setPasswordFields({ ...fields, next: value });
+  const setConfirmPassword = (value: string) => setPasswordFields({ ...fields, confirm: value });
   const [changePasswordOpen, setChangePasswordOpen] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteOpenOwner, setDeleteOpenOwner] = useState<number | null>(null);
+  const deleteOpen = deleteOpenOwner === sessionGeneration;
   const [deleteEmail, setDeleteEmail] = useState("");
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [deletionCompleted, setDeletionCompleted] = useState(false);
-  const [passwordStage, setPasswordStage] = useState<PasswordStage>("none");
-  const passwordLogoutTokenRef = useRef<string | null>(null);
+  const [deletionOwner, setDeletionOwner] = useState<number | null>(null);
+  const deletionCompleted = deletionOwner === sessionGeneration && isSessionUsable(sessionGeneration);
+  const [passwordProgress, setPasswordProgress] = useState<{ owner: number; stage: PasswordStage } | null>(null);
+  const passwordStage = passwordProgress?.owner === sessionGeneration && isSessionUsable(sessionGeneration) ? passwordProgress.stage : "none";
+  const [deleteMutationOwner, setDeleteMutationOwner] = useState<number | null>(null);
+  const [passwordMutationOwner, setPasswordMutationOwner] = useState<number | null>(null);
+  const passwordLogoutTokenRef = useRef<{ owner: number; token: string } | null>(null);
 
   const nameDirty = displayName.trim() !== savedName.trim();
   const emailDirty = email.trim().toLowerCase() !== accountEmail.toLowerCase();
@@ -82,17 +90,23 @@ export function AccountPage() {
 
   const deleteMutation = useMutation({
     mutationFn: async () => {
+      const owner = sessionGeneration;
+      setDeleteMutationOwner(owner);
       if (!deletionCompleted) {
+        if (!isSessionUsable(owner)) return false;
         await deleteAccount(token);
-        setDeletionCompleted(true);
+        if (!isSessionCurrent(owner)) return false;
+        setDeletionOwner(owner);
       }
-      return completeSession("Account deletion");
+      return completeSession("Account deletion", owner);
     },
     onSuccess: (completed) => { if (completed) navigate("/login"); },
   });
 
   const passwordMutation = useMutation({
     mutationFn: async () => {
+      let owner = sessionGeneration;
+      setPasswordMutationOwner(owner);
       let stage = passwordStage;
       if (stage === "none") {
         if (nextPassword.length < 6) {
@@ -101,21 +115,29 @@ export function AccountPage() {
         if (nextPassword !== confirmPassword) {
           throw new Error("Passwords do not match.");
         }
-        passwordLogoutTokenRef.current = await changePassword(currentPassword, nextPassword);
+        const result = await changePassword(currentPassword, nextPassword, owner);
+        if (!result) return false;
+        owner = result.originGeneration;
+        setPasswordMutationOwner(owner);
+        if (!isSessionCurrent(owner)) return false;
+        passwordLogoutTokenRef.current = { owner, token: result.sessionToken };
         stage = "password_changed";
-        setPasswordStage(stage);
+        setPasswordProgress({ owner, stage });
       }
       if (stage === "password_changed") {
         const currentToken = passwordLogoutTokenRef.current;
-        if (!currentToken) {
+        if (!currentToken || currentToken.owner !== owner) {
           throw new Error("Password change recovery state is missing.");
         }
-        await logout(currentToken);
+        if (!isSessionUsable(owner)) return false;
+        await logout(currentToken.token);
+        if (!isSessionCurrent(owner)) return false;
         stage = "backend_logged_out";
-        setPasswordStage(stage);
+        setPasswordProgress({ owner, stage });
       }
       if (stage === "backend_logged_out") {
-        const completed = await completeSession("Password change");
+        const completed = await completeSession("Password change", owner);
+        if (!isSessionCurrent(owner)) return false;
         sessionStorage.setItem("devneya.passwordChanged", "1");
         return completed;
       }
@@ -131,7 +153,7 @@ export function AccountPage() {
 
       <Container maxWidth="md" sx={{ mt: 4, mb: 6 }}>
         <Stack spacing={3}>
-          {deleteMutation.error && !deletionCompleted ? (
+          {deleteMutation.error && deleteMutationOwner === sessionGeneration && isSessionUsable(sessionGeneration) && !deletionCompleted ? (
             <Alert severity="error">
               {describeError(deleteMutation.error, "Could not delete account")}
             </Alert>
@@ -216,7 +238,7 @@ export function AccountPage() {
                   passwordMutation.mutate();
                 }}
               >
-                {passwordMutation.error ? (
+                {passwordMutation.error && passwordMutationOwner === sessionGeneration && isSessionUsable(sessionGeneration) ? (
                   <Alert severity="error">
                     {passwordStage === "backend_logged_out"
                       ? `Password changed and backend logout completed, but local sign-out failed: ${describeError(passwordMutation.error)}`
@@ -274,9 +296,7 @@ export function AccountPage() {
                     onClick={() => {
                       setChangePasswordOpen(false);
                       if (passwordStage === "none") {
-                        setCurrentPassword("");
-                        setNextPassword("");
-                        setConfirmPassword("");
+                        setPasswordFields({ owner: sessionGeneration, current: "", next: "", confirm: "" });
                         passwordMutation.reset();
                       }
                     }}
@@ -320,7 +340,7 @@ export function AccountPage() {
                   variant="outlined"
                   color="inherit"
                   onClick={() => {
-                    setDeleteOpen(true);
+                    setDeleteOpenOwner(sessionGeneration);
                     setDeleteEmail("");
                     setDeleteError(null);
                     deleteMutation.reset();
@@ -387,7 +407,7 @@ export function AccountPage() {
                       color="inherit"
                       disabled={deleteMutation.isPending}
                       onClick={() => {
-                        setDeleteOpen(false);
+                        setDeleteOpenOwner(null);
                         setDeleteEmail("");
                         setDeleteError(null);
                         deleteMutation.reset();
