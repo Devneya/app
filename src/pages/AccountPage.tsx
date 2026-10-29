@@ -1,11 +1,10 @@
 import { useRef, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Alert, Box, Button, Container, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
 import { deleteAccount, logout } from "@/api/account";
 import { describeError } from "@/api/errors";
-import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { AppChrome } from "@/components/AppChrome";
 import { Section } from "@/components/Section";
 import { brand } from "@/theme";
@@ -18,9 +17,8 @@ function readSavedName(session: ReturnType<typeof useAuth>["session"]): string {
 type PasswordStage = "none" | "password_changed" | "backend_logged_out";
 
 export function AccountPage() {
-  const { session, signOut, changePassword, updateDisplayName, updateEmail } = useAuth();
+  const { session, completeSession, changePassword, updateDisplayName, updateEmail } = useAuth();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const token = session?.access_token ?? "";
   const accountEmail = session?.user?.email ?? "";
   const savedName = readSavedName(session);
@@ -88,9 +86,9 @@ export function AccountPage() {
         await deleteAccount(token);
         setDeletionCompleted(true);
       }
-      await completeLocalSignOut(signOut, () => queryClient.clear());
+      return completeSession("Account deletion");
     },
-    onSuccess: () => navigate("/login"),
+    onSuccess: (completed) => { if (completed) navigate("/login"); },
   });
 
   const passwordMutation = useMutation({
@@ -117,12 +115,13 @@ export function AccountPage() {
         setPasswordStage(stage);
       }
       if (stage === "backend_logged_out") {
-        await completeLocalSignOut(signOut, () => queryClient.clear());
+        const completed = await completeSession("Password change");
         sessionStorage.setItem("devneya.passwordChanged", "1");
+        return completed;
       }
     },
-    onSuccess: () => {
-      navigate("/login", { replace: true });
+    onSuccess: (completed) => {
+      if (completed) navigate("/login", { replace: true });
     },
   });
 

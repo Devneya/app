@@ -56,6 +56,7 @@ type CopyError = { cause: unknown };
 export function InferencePage() {
   const { session } = useAuth();
   const queryClient = useQueryClient();
+  const [selectedAction, setSelectedAction] = useState<"subscribe" | "cancel" | "uncancel" | "portal" | null>(null);
   const [copyError, setCopyError] = useState<CopyError | null>(null);
   const token = session?.access_token ?? "";
   const userID = session?.user.id ?? "";
@@ -64,12 +65,14 @@ export function InferencePage() {
     queryKey: ["virtualKey", userID],
     queryFn: () => fetchVirtualKey(token),
     enabled: Boolean(token),
+    refetchOnWindowFocus: true,
   });
 
   const usageQuery = useQuery({
     queryKey: ["usage", userID],
     queryFn: () => fetchUsage(token),
     enabled: Boolean(token),
+    refetchOnWindowFocus: true,
   });
 
   const subscribeMutation = useMutation({
@@ -129,11 +132,17 @@ export function InferencePage() {
     }
   }
 
-  const actionError =
-    subscribeMutation.error ??
-    cancelMutation.error ??
-    uncancelMutation.error ??
-    portalMutation.error;
+  const mutations = { subscribe: subscribeMutation, cancel: cancelMutation, uncancel: uncancelMutation, portal: portalMutation };
+  const actionError = selectedAction ? mutations[selectedAction].error : null;
+
+  function startAction(action: keyof typeof mutations) {
+    for (const mutation of Object.values(mutations)) {
+      if (!mutation.isPending) mutation.reset();
+    }
+    setSelectedAction(action);
+    mutations[action].mutate();
+  }
+
 
   return (
     <>
@@ -156,6 +165,7 @@ export function InferencePage() {
             </Alert>
           ) : null}
 
+          <Button variant="outlined" onClick={() => { void usageQuery.refetch(); void keyQuery.refetch(); }}>Refresh</Button>
           <Section title="API key">
             {keyQuery.isLoading ? (
               <LinearProgress aria-label="Loading API key" />
@@ -251,7 +261,7 @@ export function InferencePage() {
                   {billingAction === "subscribe" ? (
                     <Button
                       variant="contained"
-                      onClick={() => subscribeMutation.mutate()}
+                      onClick={() => startAction("subscribe")}
                       disabled={subscribeMutation.isPending}
                     >
                       Subscribe
@@ -260,7 +270,7 @@ export function InferencePage() {
                   {cancelScheduled ? (
                     <Button
                       variant="contained"
-                      onClick={() => uncancelMutation.mutate()}
+                      onClick={() => startAction("uncancel")}
                       disabled={uncancelMutation.isPending}
                     >
                       Keep subscription
@@ -270,7 +280,7 @@ export function InferencePage() {
                     <Button
                       variant="outlined"
                       color="warning"
-                      onClick={() => cancelMutation.mutate()}
+                      onClick={() => startAction("cancel")}
                       disabled={cancelMutation.isPending}
                     >
                       Cancel subscription
@@ -279,7 +289,7 @@ export function InferencePage() {
                   {billingAction === "update_payment" ? (
                     <Button
                       variant="contained"
-                      onClick={() => portalMutation.mutate()}
+                      onClick={() => startAction("portal")}
                       disabled={portalMutation.isPending}
                     >
                       Update payment method

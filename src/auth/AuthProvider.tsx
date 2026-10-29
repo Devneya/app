@@ -4,10 +4,14 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import type { Session, User } from "@supabase/supabase-js";
+import { Alert, Button } from "@mui/material";
+import { useQueryClient } from "@tanstack/react-query";
+import { describeError } from "@/api/errors";
 import { supabase } from "@/supabase";
 
 export type SignUpResult = {
@@ -22,7 +26,7 @@ type AuthContextValue = {
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<SignUpResult>;
   signInWithProvider: (provider: "google" | "github") => Promise<void>;
-  signOut: () => Promise<void>;
+  completeSession: (action: string) => Promise<boolean>;
   resetPasswordForEmail: (email: string) => Promise<void>;
   updatePassword: (password: string) => Promise<void>;
   changePassword: (currentPassword: string, nextPassword: string) => Promise<string>;
@@ -63,6 +67,11 @@ async function updateUserChecked(
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
+  const sessionGeneration = useRef(0);
+  const sessionIdentity = useRef<string | null>(null);
+  const [cleanupError, setCleanupError] = useState<{ action: string; cause: unknown } | null>(null);
+  const [cleanupPending, setCleanupPending] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [initializationError, setInitializationError] = useState<Error | null>(null);
@@ -78,6 +87,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         authStateChangeReceived = true;
       }
       if (!mounted) return;
+      if (nextSession && (event === "SIGNED_IN" || event === "PASSWORD_RECOVERY")) {
+        if (nextSession.refresh_token !== sessionIdentity.current) {
+          sessionGeneration.current += 1;
+          setCleanupError(null);
+        }
+      }
+      if (nextSession) sessionIdentity.current = nextSession.refresh_token;
       if (event === "PASSWORD_RECOVERY" && nextSession) {
         setPasswordRecoveryPending(true);
       } else if (event === "SIGNED_OUT") {
@@ -101,6 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (error) {
           setInitializationError(error);
         }
+        sessionIdentity.current = data.session?.refresh_token ?? null;
         setSession(data.session);
         setLoading(false);
       } catch (error: unknown) {
@@ -155,12 +172,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const signOut = useCallback(async () => {
-    const { error } = await supabase.auth.signOut({ scope: "local" });
-    if (error) {
-      throw error;
+  const completeSession = useCallback(async (action: string) => {
+    const generation = sessionGeneration.current;
+    queryClient.clear();
+    setCleanupPending(true);
+    try {
+      const { error } = await supabase.auth.signOut({ scope: "local" });
+      if (error) throw error;
+      if (generation === sessionGeneration.current) setCleanupError(null);
+      return true;
+    } catch (cause) {
+      if (generation === sessionGeneration.current) setCleanupError({ action, cause });
+      return false;
+    } finally {
+      setCleanupPending(false);
     }
-  }, []);
+  }, [queryClient]);
 
   const resetPasswordForEmail = useCallback(async (email: string) => {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
@@ -226,7 +253,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       signUp,
       signInWithProvider,
-      signOut,
+      completeSession,
       resetPasswordForEmail,
       updatePassword,
       changePassword,
@@ -241,7 +268,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signIn,
       signUp,
       signInWithProvider,
-      signOut,
+      completeSession,
       resetPasswordForEmail,
       updatePassword,
       changePassword,
@@ -250,7 +277,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ]
   );
 
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={value}>
+    {cleanupError ? <Alert severity="error" onClose={() => setCleanupError(null)} action={<>
+      <Button color="inherit" disabled={cleanupPending} onClick={() => void completeSession(cleanupError.action)}>Retry browser cleanup</Button>
+      <Button color="inherit" onClick={() => setCleanupError(null)}>Dismiss</Button>
+    </>}>
+      {cleanupError.action} completed, but browser cleanup failed: {describeError(cleanupError.cause)}
+    </Alert> : null}
+    {children}
+  </AuthContext.Provider>;
 }
 
 export function useAuthContext(): AuthContextValue {

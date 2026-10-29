@@ -14,6 +14,49 @@ import {
 } from "../../tests/e2e/diagnostics.mjs";
 
 describe("browser diagnostics", () => {
+  it("drains request collection before a response and records a rejection once", async () => {
+    const listeners = new Map();
+    const pending = [];
+    const failures = [];
+    let rejectHeaders;
+    const headers = new Promise((_, reject) => { rejectHeaders = reject; });
+    installPageDiagnostics({ on: (event, listener) => listeners.set(event, listener), off() {} }, {
+      record() {}, addFailure: failure => failures.push(failure), pending,
+    });
+    listeners.get("request")({
+      url: () => "https://example.test/", method: () => "POST", resourceType: () => "fetch",
+      frame: () => null, redirectedFrom: () => null, headersArray: () => headers,
+      postData: () => null,
+    });
+    let drained = false;
+    const draining = drainBeforeClose(pending).then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    rejectHeaders(new Error("header collection failed"));
+    await draining;
+    expect(failures.filter(failure => failure.operation === "request headers")).toHaveLength(1);
+  });
+
+  it("drains response headers and body and records rejected body once", async () => {
+    const listeners = new Map();
+    const pending = [];
+    const failures = [];
+    let rejectBody;
+    const body = new Promise((_, reject) => { rejectBody = reject; });
+    installPageDiagnostics({ on: (event, listener) => listeners.set(event, listener), off() {} }, {
+      record() {}, addFailure: failure => failures.push(failure), pending,
+    });
+    const request = { url: () => "https://example.test/", method: () => "GET", resourceType: () => "fetch", frame: () => null, headersArray: async () => [], postData: () => null };
+    listeners.get("response")({ request: () => request, url: () => request.url(), status: () => 200, headers: () => ({}), headersArray: async () => [], body: () => body });
+    let drained = false;
+    const draining = drainBeforeClose(pending).then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    rejectBody(new Error("response body failed"));
+    await draining;
+    expect(failures.filter(failure => failure.operation === "response body")).toHaveLength(1);
+  });
+
   it("retains complete diagnostic detail", () => {
     const shared = { value: "complete output", card_last_four: "4242" };
     expect(safeBody({ first: shared, second: shared })).toEqual({ first: shared, second: shared });

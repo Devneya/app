@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import { Alert, AppBar, Box, Button, Menu, MenuItem, Toolbar, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
-import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { logout } from "@/api/account";
 import { describeError } from "@/api/errors";
 import { brand } from "@/theme";
@@ -31,9 +30,8 @@ const navLinkSx = (active: boolean) => ({
 });
 
 export function AppChrome({ section }: { section: "inference" | "account" }) {
-  const { session, signOut } = useAuth();
+  const { session, completeSession } = useAuth();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const label = accountLabel(session);
   const token = session?.access_token ?? "";
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -46,9 +44,9 @@ export function AppChrome({ section }: { section: "inference" | "account" }) {
         await logout(token);
         setLogoutCompleted(true);
       }
-      await completeLocalSignOut(signOut, () => queryClient.clear());
+      return completeSession("Logout");
     },
-    onSuccess: () => navigate("/login"),
+    onSuccess: (completed) => { if (completed) navigate("/login"); },
   });
 
   function closeMenu() {

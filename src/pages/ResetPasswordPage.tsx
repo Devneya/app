@@ -1,9 +1,7 @@
 import { useRef, useState } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
 import { Alert, Box, Button, Link, Stack, TextField, Typography } from "@mui/material";
 import { useAuth } from "@/auth/useAuth";
-import { completeLocalSignOut } from "@/auth/completeLocalSignOut";
 import { logout } from "@/api/account";
 import { describeError } from "@/api/errors";
 import { AuthShell } from "@/components/AuthShell";
@@ -12,9 +10,8 @@ type PasswordStage = "none" | "password_changed" | "backend_logged_out";
 type ResetError = { cause: unknown; stage: PasswordStage };
 
 export function ResetPasswordPage() {
-  const { session, passwordRecoveryPending, updatePassword, signOut } = useAuth();
+  const { session, passwordRecoveryPending, updatePassword, completeSession } = useAuth();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -57,10 +54,12 @@ export function ResetPasswordPage() {
       }
 
       if (stage === "backend_logged_out") {
-        await completeLocalSignOut(signOut, () => queryClient.clear());
+        const completed = await completeSession("Password recovery");
         sessionStorage.setItem("devneya.passwordChanged", "1");
-        setDone(true);
-        navigate("/login", { replace: true });
+        if (completed) {
+          setDone(true);
+          navigate("/login", { replace: true });
+        }
       }
     } catch (err) {
       setError({ cause: err, stage });

@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
@@ -31,7 +32,7 @@ function mockAuthSession(session: Session | null) {
 
 function page() {
   return (
-    <AuthProvider>
+    <QueryClientProvider client={new QueryClient()}><AuthProvider>
       <MemoryRouter initialEntries={["/previous", "/auth/confirm"]} initialIndex={1}>
         <Routes>
           <Route path="/previous" element={<h1>Previous page</h1>} />
@@ -40,7 +41,7 @@ function page() {
           <Route path="/login" element={<h1>Sign in</h1>} />
         </Routes>
       </MemoryRouter>
-    </AuthProvider>
+    </AuthProvider></QueryClientProvider>
   );
 }
 

@@ -8,6 +8,8 @@ import { setMockBillingState, setMockSubscribed } from "@/mocks/handlers";
 import { config } from "@/config";
 import { server } from "@/mocks/server";
 import { supabase } from "@/supabase";
+import { queryClient } from "@/App";
+import { focusManager } from "@tanstack/react-query";
 
 async function signInViaUi() {
   const user = userEvent.setup();
@@ -176,16 +178,184 @@ describe("InferencePage", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Backend logout completed, but local sign-out failed"
+        "Logout completed, but browser cleanup failed"
       );
-      expect(screen.getByRole("button", { name: "Finish local sign-out" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Retry browser cleanup" })).toBeInTheDocument();
     });
     expect(logoutRequests).toBe(1);
 
-    await user.click(screen.getByRole("button", { name: "Finish local sign-out" }));
+    await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
     });
     expect(logoutRequests).toBe(1);
   });
+  it("refreshes usage and key after delayed activation", async () => {
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    setMockSubscribed(true);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => {
+      expect(screen.getByText(/Status:/)).toHaveTextContent("active");
+      expect(screen.getByText(MOCK_VIRTUAL_KEY)).toBeInTheDocument();
+    });
+  });
+
+  it("clears cached data before SDK cleanup after verified logout", async () => {
+    const signOut = vi.spyOn(supabase.auth, "signOut").mockImplementation(async () => {
+      expect(queryClient.getQueryData(["cleanup-order"])).toBeUndefined();
+      return { error: null };
+    });
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    queryClient.setQueryData(["cleanup-order"], "retained");
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Log out" }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledOnce());
+  });
+
+  it("preserves cached data when backend logout fails", async () => {
+    server.use(http.post(`${config.apiBaseUrl}/account/logout`, () => HttpResponse.json({ error: "unavailable" }, { status: 500 })));
+    const signOut = vi.spyOn(supabase.auth, "signOut");
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    queryClient.setQueryData(["backend-failure"], "retained");
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Log out" }));
+    await screen.findByText(/Could not log out/);
+    expect(queryClient.getQueryData(["backend-failure"])).toBe("retained");
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it("keeps cleanup retry visible when the SDK removes the session and returns an error", async () => {
+    const realSignOut = supabase.auth.signOut.bind(supabase.auth);
+    vi.spyOn(supabase.auth, "signOut").mockImplementationOnce(async () => {
+      await realSignOut({ scope: "local" });
+      return { error: new Error("cleanup failed") as never };
+    }).mockImplementation(() => realSignOut({ scope: "local" }));
+    renderApp("/login");
+    const user = await signInViaUi();
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Log out" }));
+    expect(await screen.findByText(/Logout completed, but browser cleanup failed/)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
+    await waitFor(() => expect(screen.queryByText(/Logout completed, but browser cleanup failed/)).not.toBeInTheDocument());
+  });
+
+  it("reports account deletion cleanup failure without repeating deletion", async () => {
+    let deletions = 0;
+    server.use(http.delete(`${config.apiBaseUrl}/account`, () => { deletions++; return HttpResponse.json({ status: "deleted" }); }));
+    vi.spyOn(supabase.auth, "signOut").mockRejectedValueOnce(new Error("cleanup unavailable")).mockResolvedValue({ error: null });
+    renderApp("/login");
+    const user = await signInViaUi();
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Profile" }));
+    await user.click(await screen.findByRole("button", { name: "Delete account" }));
+    await user.type(screen.getByLabelText(/Account email/i), MOCK_USER.email);
+    await user.click(screen.getByRole("button", { name: "Confirm delete" }));
+    expect(await screen.findByText(/Account deletion completed, but browser cleanup failed/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
+    expect(deletions).toBe(1);
+  });
+
+  it("reports password change cleanup failure without repeating the change or logout", async () => {
+    let logouts = 0;
+    server.use(http.post(`${config.apiBaseUrl}/account/logout`, () => { logouts++; return HttpResponse.json({ status: "logged_out" }); }));
+    const update = vi.spyOn(supabase.auth, "updateUser");
+    vi.spyOn(supabase.auth, "signOut").mockRejectedValueOnce(new Error("cleanup unavailable")).mockResolvedValue({ error: null });
+    renderApp("/login");
+    const user = await signInViaUi();
+    await openAccountMenu(user);
+    await user.click(screen.getByRole("menuitem", { name: "Profile" }));
+    await user.click(await screen.findByRole("button", { name: "Change password" }));
+    await user.type(screen.getByLabelText(/Current password/i), MOCK_USER.password);
+    await user.type(screen.getByLabelText(/^New password/i), "new-password");
+    await user.type(screen.getByLabelText(/Confirm new password/i), "new-password");
+    await user.click(screen.getByRole("button", { name: "Save new password" }));
+    expect(await screen.findByText(/Password change completed, but browser cleanup failed/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
+    expect(logouts).toBe(1);
+    expect(update).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes usage and key on window focus after delayed activation", async () => {
+    renderApp("/login");
+    await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    focusManager.setFocused(false);
+    setMockSubscribed(true);
+    focusManager.setFocused(true);
+    await waitFor(() => {
+      expect(screen.getByText(/Status:/)).toHaveTextContent("active");
+      expect(screen.getByText(MOCK_VIRTUAL_KEY)).toBeInTheDocument();
+    });
+    focusManager.setFocused(undefined);
+  });
+
+  it("keeps refresh available and shows a partial refresh failure", async () => {
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    setMockSubscribed(true);
+    server.use(http.get(`${config.apiBaseUrl}/account/usage`, () => HttpResponse.json({ error: { code: "failure", message: "Usage unavailable", request_id: "test" } }, { status: 500 })));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Usage unavailable/)).toBeInTheDocument();
+    expect(await screen.findByText(MOCK_VIRTUAL_KEY)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  });
+
+  it("keeps the latest billing action error when an older action finishes", async () => {
+    let finishSubscribe!: () => void;
+    const subscribeWait = new Promise<void>(resolve => { finishSubscribe = resolve; });
+    server.use(
+      http.post(`${config.apiBaseUrl}/account/subscribe`, async () => {
+        await subscribeWait;
+        return HttpResponse.json({ error: { code: "failure", message: "Older subscribe failure", request_id: "old" } }, { status: 500 });
+      }),
+      http.post(`${config.apiBaseUrl}/account/subscribe/cancel`, () => HttpResponse.json({ error: { code: "failure", message: "Current cancellation failure", request_id: "new" } }, { status: 500 }))
+    );
+    renderApp("/login");
+    const user = await signInViaUi();
+    await user.click(await screen.findByRole("button", { name: "Subscribe" }));
+    setMockSubscribed(true);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel subscription" }));
+    expect(await screen.findByText(/Current cancellation failure/)).toBeInTheDocument();
+    finishSubscribe();
+    await waitFor(() => expect(screen.getByText(/Current cancellation failure/)).toBeInTheDocument());
+    expect(screen.queryByText(/Older subscribe failure/)).not.toBeInTheDocument();
+  });
+
+  it("replaces a completed billing action error with the next action error", async () => {
+    server.use(
+      http.post(`${config.apiBaseUrl}/account/subscribe`, () => HttpResponse.json({ error: { code: "failure", message: "Subscribe failed first", request_id: "first" } }, { status: 500 })),
+      http.post(`${config.apiBaseUrl}/account/subscribe/cancel`, () => HttpResponse.json({ error: { code: "failure", message: "Cancellation failed next", request_id: "next" } }, { status: 500 }))
+    );
+    renderApp("/login");
+    const user = await signInViaUi();
+    await user.click(await screen.findByRole("button", { name: "Subscribe" }));
+    await screen.findByText(/Subscribe failed first/);
+    setMockSubscribed(true);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel subscription" }));
+    expect(await screen.findByText(/Cancellation failed next/)).toBeInTheDocument();
+    expect(screen.queryByText(/Subscribe failed first/)).not.toBeInTheDocument();
+  });
+
+  it("shows key refresh failure while usage refresh succeeds", async () => {
+    renderApp("/login");
+    const user = await signInViaUi();
+    await screen.findByRole("button", { name: "Subscribe" });
+    setMockSubscribed(true);
+    server.use(http.get(`${config.apiBaseUrl}/account/key`, () => HttpResponse.json({ error: { code: "failure", message: "Key unavailable", request_id: "test" } }, { status: 500 })));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Key unavailable/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/Status:/)).toHaveTextContent("active"));
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  });
+
 });

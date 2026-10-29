@@ -933,13 +933,13 @@ function captureResponse(response, options, state) {
   let responseHeadersValue;
   let responseBodySerialized;
 
-  const responseHeadersTask = (routedBodyPromise
+  const responseHeadersTask = trackPending(options.pending, "response headers", (routedBodyPromise
     ? routedBodyPromise.then(capture => capture.ok ? capture.headers : { collection_error: safeError(capture.error) })
     : collect("response headers", () => readHeaders(response), context, options.addFailure)
   ).then(headers => {
     responseHeadersValue = headers;
     return headers;
-  });
+  }), context, options.addFailure);
 
   let responseBodyTask;
   if (isBlob) {
@@ -988,13 +988,15 @@ function captureResponse(response, options, state) {
     }
     return responseBodySerialized;
   });
-  const captureTask = Promise.all([
+  responseBodyTask = trackPending(options.pending, "response body", responseBodyTask, context, options.addFailure);
+  const captureTask = Promise.allSettled([
     responseHeadersTask,
     responseBodyTask,
     state.requestHeadersTask,
     state.requestBodyTask,
     state.requestStarted ? state.networkSettled : Promise.resolve(),
-  ]).then(() => {
+  ]).then(results => {
+    if (results.some(result => result.status === "rejected")) return;
     const captureSource = routedBodyPromise && !isBlob ? "playwright-route-fetch" : "playwright";
     const bodyEvidence = responseBodyCaptureEvidence({
       isBlob,
@@ -1246,7 +1248,7 @@ export function installPageDiagnostics(
         state.requestHeadersReady = true;
         return headers;
       });
-      state.requestHeadersTask = headersTask;
+      state.requestHeadersTask = trackPending(pending, "request headers", headersTask, state.context, options.addFailure);
 
       const bodyTask = headersTask.then(headers => collect(
         "request body",
@@ -1258,7 +1260,7 @@ export function installPageDiagnostics(
         state.requestBodyReady = true;
         return body;
       });
-      state.requestBodyTask = bodyTask;
+      state.requestBodyTask = trackPending(pending, "request body", bodyTask, state.context, options.addFailure);
       return state;
     },
   };

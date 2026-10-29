@@ -1,4 +1,5 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Session, User } from "@supabase/supabase-js";
 import { AuthProvider, useAuthContext } from "@/auth/AuthProvider";
@@ -44,7 +45,7 @@ async function renderAuth(initialSession: Session | null = null) {
   });
 
   const rendered = renderHook(() => useAuthContext(), {
-    wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+    wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
   });
   await waitFor(() => expect(rendered.result.current.loading).toBe(false));
   return rendered;
@@ -96,7 +97,7 @@ describe("AuthProvider response validation", () => {
     });
 
     const rendered = renderHook(() => useAuthContext(), {
-      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+      wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
     });
 
     await waitFor(() => expect(rendered.result.current.passwordRecoveryPending).toBe(true));
@@ -124,7 +125,7 @@ describe("AuthProvider response validation", () => {
     });
 
     const rendered = renderHook(() => useAuthContext(), {
-      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+      wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
     });
     await waitFor(() => expect(supabase.auth.getSession).toHaveBeenCalledOnce());
 
@@ -152,7 +153,7 @@ describe("AuthProvider response validation", () => {
     });
 
     const rendered = renderHook(() => useAuthContext(), {
-      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+      wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
     });
     await waitFor(() => expect(rendered.result.current.initializationError).toBe(lookupError));
   });
@@ -171,7 +172,7 @@ describe("AuthProvider response validation", () => {
     });
 
     const rendered = renderHook(() => useAuthContext(), {
-      wrapper: ({ children }) => <AuthProvider>{children}</AuthProvider>,
+      wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
     });
 
     await waitFor(() => expect(rendered.result.current.initializationError).toBe(initializationError));
@@ -291,4 +292,34 @@ describe("AuthProvider response validation", () => {
       cause: returnedUser,
     });
   });
+  it.each(["SIGNED_IN", "PASSWORD_RECOVERY"] as const)("clears cleanup notice only for a new %s session", async (event) => {
+    let authEvent!: Parameters<typeof supabase.auth.onAuthStateChange>[0];
+    vi.spyOn(supabase.auth, "initialize").mockResolvedValue({ error: null });
+    vi.spyOn(supabase.auth, "getSession").mockResolvedValue({ data: { session: testSession }, error: null });
+    vi.spyOn(supabase.auth, "onAuthStateChange").mockImplementation(callback => {
+      authEvent = callback;
+      return { data: { subscription: { id: "session-test", callback: vi.fn(), unsubscribe: vi.fn() } } };
+    });
+    vi.spyOn(supabase.auth, "signOut").mockRejectedValue(new Error("cleanup unavailable"));
+    const { result } = renderHook(() => useAuthContext(), {
+      wrapper: ({ children }) => <QueryClientProvider client={new QueryClient()}><AuthProvider>{children}</AuthProvider></QueryClientProvider>,
+    });
+    await waitFor(() => expect(result.current.session).toBe(testSession));
+    await act(async () => { await result.current.completeSession("Logout"); });
+    expect(screen.getByText(/Logout completed, but browser cleanup failed/)).toBeInTheDocument();
+    act(() => { authEvent("SIGNED_IN", testSession); });
+    expect(screen.getByText(/Logout completed, but browser cleanup failed/)).toBeInTheDocument();
+    act(() => { authEvent(event, { ...testSession, refresh_token: "new-refresh-token" }); });
+    expect(screen.queryByText(/Logout completed, but browser cleanup failed/)).not.toBeInTheDocument();
+  });
+
+  it("dismisses the cleanup notice without retrying", async () => {
+    vi.spyOn(supabase.auth, "signOut").mockRejectedValue(new Error("cleanup unavailable"));
+    const { result } = await renderAuth(testSession);
+    await act(async () => { await result.current.completeSession("Logout"); });
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/Logout completed, but browser cleanup failed/)).not.toBeInTheDocument();
+    expect(supabase.auth.signOut).toHaveBeenCalledOnce();
+  });
+
 });

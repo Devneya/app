@@ -62,4 +62,19 @@ describe("ResetPasswordPage", () => {
     expect(supabase.auth.updateUser).toHaveBeenCalledOnce();
     expect(account.logout).toHaveBeenCalledOnce();
   });
+  it("reports recovery completion and retries only browser cleanup", async () => {
+    vi.mocked(account.logout).mockResolvedValue({ status: "logged_out" });
+    vi.mocked(supabase.auth.signOut).mockRejectedValueOnce(new Error("cleanup unavailable"));
+    renderPage();
+    const user = userEvent.setup();
+    const fields = await screen.findAllByLabelText(/password/i);
+    await user.type(fields[0], "new-password");
+    await user.type(fields[1], "new-password");
+    await user.click(screen.getByRole("button", { name: "Save password" }));
+    expect(await screen.findByText(/Password recovery completed, but browser cleanup failed/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry browser cleanup" }));
+    expect(account.logout).toHaveBeenCalledOnce();
+    expect(supabase.auth.updateUser).toHaveBeenCalledOnce();
+  });
+
 });
